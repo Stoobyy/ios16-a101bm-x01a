@@ -1,7 +1,7 @@
 diff --git a/loader.c b/loader.c
 old mode 100755
 new mode 100644
-index ab5a781..8fe1abc
+index ab5a781..86687ef
 --- a/loader.c
 +++ b/loader.c
 @@ -524,6 +524,7 @@ struct platform {
@@ -30,13 +30,32 @@ index ab5a781..8fe1abc
 +	 * The architected timer is on PPIs 1, 2, 3, 0 here: the virtual one is INTID 19, not 27. And
 +	 * the board's drivers are told which phone this is (touch screen and keys: hakios_board_is()).
 +	 */
-+	.kernel_args = "vtimer_intid=19 hakios_board=x01a ",
++	.kernel_args = "vtimer_intid=19 hakios_board=x01a fb_fit=1 ",
 +};
 +
  /* ------------------------------------------------------------------------ */
  
  static void
-@@ -2432,7 +2450,7 @@ wdt_arm(void)
+@@ -2166,12 +2184,16 @@ charger_start(void)
+ 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
+ 	efi_status ex_status, qcom_status, init_status = 0;
+ 
+-	if (charger_enabled || PLAT != &platform_redwood) {
++	if (charger_enabled || (PLAT != &platform_redwood && PLAT != &platform_x01a)) {
+ 		return;
+ 	}
+ 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
+ 	qcom_status = BS->locate_protocol(&qcom_charger_guid, NULL, (void **)&QCOM_CHARGER);
+-	if (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL) {
++	/*
++	 * X01A: its own QcomChargerDxe and ChargerExDxe (PM7250B, QG gauge), only asked, never
++	 * re-initialised: what the charger does stays the firmware's as it left it.
++	 */
++	if (!EFI_ERROR(qcom_status) && QCOM_CHARGER != NULL && PLAT == &platform_redwood) {
+ 		/* Re-open the driver's status path after QcomChargerApp handed off to the OS. */
+ 		init_status = QCOM_CHARGER->initialize(1);
+ 	}
+@@ -2432,7 +2454,7 @@ wdt_arm(void)
  {
  	uint64_t ctl = 0, since = 0;
  
@@ -45,7 +64,7 @@ index ab5a781..8fe1abc
  		return; /* SMC is not routed anywhere useful on QEMU virt */
  	}
  	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);
-@@ -2977,6 +2995,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -2977,6 +2999,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  			ba->commandLine[n++] = *c;
  		}
  	}
@@ -57,7 +76,7 @@ index ab5a781..8fe1abc
  	if (wdt_armed) {
  		for (const char *c = "hv_wdt_pet=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
  			ba->commandLine[n++] = *c;
-@@ -3696,6 +3719,29 @@ fb_command(char *cmd)
+@@ -3696,6 +3723,29 @@ fb_command(char *cmd)
  			staged_data = (const char *)(uintptr_t)SCREEN.base;
  			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
  			fb_reply("OKAY", "");
@@ -87,7 +106,20 @@ index ab5a781..8fe1abc
  		} else if (starts_with(cmd, "oem recording")) {
  			/* stage what the kernel's display driver recorded (boot-arg rec_secs) */
  			if (recording_data == NULL) {
-@@ -3932,6 +3978,8 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -3916,6 +3966,12 @@ efi_main(efi_handle image, efi_system_table *st)
+ 	BS = st->bs;
+ 	IMAGE = image;
+ 
++	/* X01A: the screen is iOS's to draw on; what the loader says goes to its log (and over USB) only */
++	if (!EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) && GOP != NULL && GOP->mode != NULL &&
++	    GOP->mode->fb_base == 0xA0000000ULL) {
++		screen_quiet = 1;
++	}
++
+ 	BS->set_watchdog_timer(0, 0, 0, NULL);
+ 	print("== XNULOADER v3 ==\n");
+ 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
+@@ -3932,6 +3988,8 @@ efi_main(efi_handle image, efi_system_table *st)
  		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
  		if (SCREEN.base == 0xE1000000ULL) {
  			PLAT = &platform_redwood;

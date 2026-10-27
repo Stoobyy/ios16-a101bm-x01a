@@ -47,6 +47,88 @@
  	uint32_t mine = 1u << GIC_INTID_VTIMER;
  
  	if (gicd_base == 0) {
+--- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -111,6 +111,15 @@
+ #define kFBPointsHigh           812
+ #define kFBDefaultScale         3
+ static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
++/*
++ * Boot-arg fb_fit=1: the display in its own proportions, centred, instead of stretched to fill the
++ * panel (the BALMUDA Phone's 1080 x 1920 against the iPhone X's 1125 x 2436: 887 x 1920 in the
++ * middle, black at the sides). The touch screen's driver maps into the same rectangle.
++ */
++static TUNABLE(uint32_t, gFit, "fb_fit", 0);
++/* x, y, width, height of the display on the panel, then the panel's width and height (0: not yet) */
++extern "C" uint32_t hakios_fb_view[6];
++uint32_t hakios_fb_view[6];
+ /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
+ static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
+ 
+@@ -229,6 +238,7 @@
+ 	IOLock *        fLock;
+ 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
+ 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
++	uint32_t        fViewX, fViewY, fViewWidth, fViewHeight;        /* where on the panel the display goes */
+ 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
+ 	MiniIOSurface * fDefaultSurface;
+ 	uint32_t        fSwapID;
+@@ -439,12 +449,38 @@
+ 			}
+ 		}
+ 	}
++	fViewX = fViewY = 0;
++	fViewWidth = fPanelWidth;
++	fViewHeight = fPanelHeight;
++	if (gFit != 0 && (uint64_t) fWidth * fPanelHeight != (uint64_t) fHeight * fPanelWidth) {
++		/* the display's own proportions, as large as the panel allows, in the middle; the rest black */
++		if ((uint64_t) fWidth * fPanelHeight < (uint64_t) fHeight * fPanelWidth) {
++			fViewWidth = (uint32_t) ((uint64_t) fWidth * fPanelHeight / fHeight);
++			fViewX = (fPanelWidth - fViewWidth) / 2;
++		} else {
++			fViewHeight = (uint32_t) ((uint64_t) fHeight * fPanelWidth / fWidth);
++			fViewY = (fPanelHeight - fViewHeight) / 2;
++		}
++		for (uint32_t y = 0; y < fPanelHeight; y++) {
++			bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
++		}
++	}
++	hakios_fb_view[0] = fViewX;
++	hakios_fb_view[1] = fViewY;
++	hakios_fb_view[2] = fViewWidth;
++	hakios_fb_view[3] = fViewHeight;
++	hakios_fb_view[4] = fPanelWidth;
++	hakios_fb_view[5] = fPanelHeight;
+ 	fColumn = IONewZero(uint32_t, fPanelWidth);
+ 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
+ 	fDiff = gDiff != 0;
+ 	fDiffLeft = fDiffTop = ~0u;
+-	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
+-	    fPanelWidth, fPanelHeight, fRowBytes);
++	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)%s\n", fWidth, fHeight,
++	    fPanelWidth, fPanelHeight, fRowBytes, fViewWidth != fPanelWidth || fViewHeight != fPanelHeight ? "" : ", filling it");
++	if (fViewWidth != fPanelWidth || fViewHeight != fPanelHeight) {
++		IOLog("MiniIOMobileFramebuffer: in its own proportions (fb_fit): %ux%u at %u,%u of the panel\n", fViewWidth,
++		    fViewHeight, fViewX, fViewY);
++	}
+ 
+ 	if (gRecSeconds != 0) {
+ 		/* one piece of physical memory: the loader will send it over USB as it lies */
+@@ -739,10 +775,10 @@
+ 		return;
+ 	}
+ 	/* the rectangle on the panel */
+-	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
+-	py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
+-	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
+-	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
++	px0 = (int32_t) (fViewX + (int64_t) dx * fViewWidth / fWidth);
++	py0 = (int32_t) (fViewY + (int64_t) dy * fViewHeight / fHeight);
++	px1 = (int32_t) (fViewX + (int64_t) (dx + dw) * fViewWidth / fWidth);
++	py1 = (int32_t) (fViewY + (int64_t) (dy + dh) * fViewHeight / fHeight);
+ 	if (px1 <= px0 || py1 <= py0) {
+ 		return;
+ 	}
 --- a/xnu/files/bsd/dev/hakios.buttons.c
 +++ b/xnu/files/bsd/dev/hakios.buttons.c
 @@ -151,6 +151,13 @@
@@ -266,7 +348,7 @@
  		thread_deallocate(thread);
 --- /dev/null
 +++ b/xnu/files/bsd/dev/hakios.ilitek.c
-@@ -0,0 +1,764 @@
+@@ -0,0 +1,791 @@
 +/*
 + * The touch screen of the BALMUDA Phone (Kyocera X01A, SM7250 "lito"): the touch half of its
 + * Ilitek ILI7807S display driver, on the I2C bus of the SoC's serial engine 7, as a source of
@@ -840,6 +922,31 @@
 +
 +static uint32_t flip;
 +
++/*
++ * The display's rectangle on the panel (MiniIOMobileFramebuffer.cpp, fb_fit=1): x, y, width,
++ * height, then the panel's width and height. A touch is posted in display coordinates, so one
++ * on the black at the sides is taken to the nearest edge.
++ */
++extern uint32_t hakios_fb_view[6];
++
++static uint32_t
++to_display(uint32_t at, uint32_t view_at, uint32_t view_size, uint32_t panel_size)
++{
++	int64_t pixel;
++
++	if (view_size == 0 || panel_size == 0 || view_size == panel_size) {
++		return at;
++	}
++	pixel = (int64_t)at * panel_size / 65535 - view_at;
++	if (pixel <= 0) {
++		return 0;
++	}
++	if (pixel >= view_size) {
++		return 65535;
++	}
++	return (uint32_t)(pixel * 65535 / view_size);
++}
++
 +static void
 +report(const uint8_t *r)
 +{
@@ -884,6 +991,8 @@
 +		if (flip & 2) {
 +			y = 65535 - y;
 +		}
++		x = to_display(x, hakios_fb_view[0], hakios_fb_view[2], hakios_fb_view[4]);
++		y = to_display(y, hakios_fb_view[1], hakios_fb_view[3], hakios_fb_view[5]);
 +		if (!contact[id].down) {
 +			hakios_touch_post(HAKIOS_TOUCH_DOWN, id, x, y);
 +		} else if (contact[id].x != x || contact[id].y != y) {

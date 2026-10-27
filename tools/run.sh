@@ -4,7 +4,7 @@
 # Boots out/xnu-usb.img (loader/build.sh) with fastboot, uploads HAKIOS_DIR/userland/system.apfs
 # into the phone's RAM (about 90 s), stages the kernel with userland/root.apfs, runs it for
 # SECONDS (default 240), then fetches the log into out/logs/.
-#   ARGS="..."    the kernel's arguments (default: cpus=8 touchscreen=1 buttons=1 -v)
+#   ARGS="..."    the kernel's arguments (default: cpus=8 touchscreen=1 buttons=1 battery=1; add -v for the boot text)
 #   RESIDENT=1    the loader is up and still has the system image: skip the upload
 #   KERNEL=FILE   another kernel than HAKIOS_DIR's build
 # Works from Linux and from Git Bash on Windows (fastboot and adb on the PATH, python3 or python).
@@ -12,9 +12,13 @@ set -e
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 H=$(cd "$1" && pwd)
 SECS=${2:-240}
-ARGS=${ARGS:-cpus=8 touchscreen=1 buttons=1 -v}
+ARGS=${ARGS:-cpus=8 touchscreen=1 buttons=1 battery=1}
 KERNEL=${KERNEL:-$H/xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837}
-PY=$(command -v python3 || command -v python)
+# (on Windows "python3" can be the Store's stand-in, which only says it is not installed)
+for PY in python3 python py ""; do
+	[ -n "$PY" ] && "$PY" -c "import sys" >/dev/null 2>&1 && break
+done
+[ -n "$PY" ] || { echo "run.sh: no working python3/python on the PATH"; exit 1; }
 OUT=$HERE/out
 mkdir -p "$OUT/logs"
 

@@ -14,10 +14,14 @@ Works:
 - boots to the home screen, all 8 cores (about 80 s from launchd to SpringBoard)
 - touch screen, multitouch
 - power, volume up and volume down
+- battery level (read once at boot), local time zone
+- a clean boot screen: no text, just the logo, then iOS
+- the picture in its real proportions (iOS thinks it's an iPhone X, 1125x2436, so it's drawn at
+  887x1920 in the middle of the 1080x1920 panel)
 
 Doesn't work yet: sound, Wi-Fi, Bluetooth, cellular, cameras, GPU (rendering is in software),
-charging, and anything that needs an Apple account. The picture is a little squashed: iOS thinks
-it's an iPhone X (1125x2436) and that gets scaled onto the 1080x1920 panel.
+charging, and anything that needs an Apple account. See [NOTES.md](NOTES.md) for what was found on
+the way, and what the next pieces would take.
 
 ## How it boots
 
@@ -50,6 +54,10 @@ What the patches change, compared to the POCO:
 - Buttons: power and volume up on the PM8150's power-on block, volume down on GPIO5 of the PM8150L.
 - The UEFI hands over to the XNU loader right after the Volume Up check instead of after its USB,
   PXE and disk attempts. Holding Volume Up still opens the boot manager.
+- The framebuffer can draw the display in its own proportions (`fb_fit=1`, which the loader passes
+  here), and touches map into the same rectangle.
+- The loader reads the battery from this phone's own UEFI charger drivers, without restarting them,
+  and keeps its text off the screen.
 
 ## Building
 
@@ -61,7 +69,6 @@ tree.
 # UEFI
 mu-silicium-saipan/apply.sh ~/Mu-Silicium
 uefi/apply.sh ~/Mu-Silicium
-cd ~/Mu-Silicium && python3 build_uefi.py -d x01a -r DEBUG && cd -
 
 # kernel
 kernel/apply.sh ~/hakios                  # patches xnu/files
@@ -70,9 +77,11 @@ kernel/apply.sh ~/hakios                  # again, for the kernel's file list
 (cd ~/hakios && ./xnu-build.sh -j12 -k)
 
 # iOS images and the loader's identity, from Apple's IPSW
-(cd ~/hakios && sysimage/fetch.sh && REST=1 userland/build.sh && xnuloader/mkidentity.sh)
+(cd ~/hakios && sysimage/fetch.sh && xnuloader/mkidentity.sh)
+tools/build_userland.sh ~/hakios Asia/Kolkata    # your time zone; HakiOS would take the PC's
 
-# loader + UEFI boot image
+# loader + UEFI boot image (RELEASE UEFI: no driver text on the screen; MODE=DEBUG for it)
+cd ~/Mu-Silicium && python3 build_uefi.py -d x01a -r RELEASE && cd -
 loader/build.sh ~/hakios ~/Mu-Silicium    # -> out/xnu-usb.img
 ```
 
@@ -86,7 +95,9 @@ tools/run.sh ~/hakios 240
 ```
 
 That boots the loader, uploads the 2.4 GB system image into RAM, and runs iOS for 240 seconds.
-Then it brings back the log. The phone has to be unlocked (`fastboot boot` allowed).
+Then it brings back the log. The phone has to be unlocked (`fastboot boot` allowed). The kernel
+gets `cpus=8 touchscreen=1 buttons=1 battery=1`; `ARGS="... -v"` shows the boot text instead.
+`RESIDENT=1` skips the upload when the loader is still up from the last run.
 
 Things to know:
 

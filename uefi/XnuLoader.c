@@ -314,16 +314,21 @@ StartPayloadLoader ()
 }
 
 //
-// X01A bring-up: say each step on screen (and in the debug log) before taking it, so a hang
-// shows where it happened.
+// X01A bring-up: say each step (in the debug log, and on screen once it is stage 0) before taking
+// it, so a hang shows where it happened. With loader.efi in the payload the screen is left as it
+// is: the boot logo stays until iOS draws.
 //
+STATIC BOOLEAN mOnScreen;
+
 STATIC
 VOID
 Step (
   IN CONST CHAR8 *Name)
 {
   DEBUG ((EFI_D_ERROR, "XnuLoader: %a\n", Name));
-  AsciiPrint ("XnuLoader: %a\n", Name);
+  if (mOnScreen) {
+    AsciiPrint ("XnuLoader: %a\n", Name);
+  }
 }
 
 VOID
@@ -331,13 +336,14 @@ XnuLoaderMain ()
 {
   EFI_TIME Time;
 
-  gST->ConOut->ClearScreen (gST->ConOut);
   Step ("start");
 
   // Normally does not return
   Step ("payload loader");
   StartPayloadLoader ();
 
+  gST->ConOut->ClearScreen (gST->ConOut);
+  mOnScreen = TRUE;
   Step ("no loader.efi in the payload, stage 0");
   mLog = AllocateZeroPool (LOG_SIZE);
   if (mLog != NULL) {
