@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.efi binary
+*.depex binary
+*.dtb binary
+files/Binaries/**/RawFiles/* -text
+*.patch -text

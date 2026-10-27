@@ -1,0 +1,1033 @@
+--- a/xnu/files/osfmk/arm64/gic_v3_irq.c
++++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
+@@ -72,7 +72,14 @@
+ 
+ #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
+ #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
+-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
++/*
++ * EL1 virtual timer PPI: 27 on redwood, as the architecture suggests, but the SoC decides. On the
++ * BALMUDA Phone (SM7250) its device tree has the timer on PPI 3, INTID 19. Boot-arg vtimer_intid=N
++ * (16 to 31) says which; the loader passes it for the phones that need it.
++ */
++static uint32_t gic_intid_vtimer = 27;
++static bool gic_vtimer_from_bootarg;    /* (then the timer is the kernel's alone, and goes quiet on the way back) */
++#define GIC_INTID_VTIMER        gic_intid_vtimer
+ #define GIC_INTID_SPI_MIN       32
+ #define GIC_INTID_SPURIOUS_MIN  1020
+ #define GIC_SPI_MOST            48          /* attached at a time */
+@@ -362,6 +369,16 @@
+ 		__builtin_arm_isb(ISB_SY);
+ 		gic_active_iar[cpu] = 0;
+ 	}
++	/*
++	 * A timer on a PPI the firmware does not own (vtimer_intid=, the BALMUDA Phone's 19) must not
++	 * go on firing under it: UEFI's GIC driver takes it, calls it spurious, and takes it again.
++	 */
++	if (gic_vtimer_from_bootarg && gicr_cpu_base[cpu] != 0) {
++		__builtin_arm_wsr64("CNTV_CTL_EL0", 0);
++		__builtin_arm_isb(ISB_SY);
++		gic_write32(gicr_cpu_base[cpu] + GICR_ICENABLER0, 1u << GIC_INTID_VTIMER);
++		gic_write32(gicr_cpu_base[cpu] + GICR_ICPENDR0, 1u << GIC_INTID_VTIMER);
++	}
+ }
+ 
+ /*
+@@ -418,6 +435,13 @@
+ {
+ 	int cpu = cpu_number();
+ 	vm_offset_t gicr;
++	uint32_t intid;
++
++	if (cpu == 0 && PE_parse_boot_argn("vtimer_intid", &intid, sizeof(intid)) && intid >= 16 && intid < 32) {
++		gic_intid_vtimer = intid;
++		gic_vtimer_from_bootarg = true;
++	}
++
+ 	uint32_t mine = 1u << GIC_INTID_VTIMER;
+ 
+ 	if (gicd_base == 0) {
+--- a/xnu/files/bsd/dev/hakios.buttons.c
++++ b/xnu/files/bsd/dev/hakios.buttons.c
+@@ -151,6 +151,13 @@
+ };
+ static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
+ static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
++/*
++ * The BALMUDA Phone (hakios_board=x01a, SM7250): the PM8150's power-on block (slave 0, 0x800),
++ * whose RESIN is volume up there, and volume down on GPIO5 of the PM8150L (slave 4, 0xc400),
++ * active low (its device tree: qcom,power-on@800, gpio_keys/vol_down).
++ */
++static const struct peripheral x01a_pon = { .name = "the PM8150's power-on block", .id = 0x008 };
++static const struct peripheral x01a_pin = { .name = "GPIO5 of the PM8150L", .id = 0x4c4 };
+ 
+ /* How the reads have gone: said once a minute. */
+ static struct {
+@@ -250,6 +257,14 @@
+ #define PON_SUBTYPE_HLOS        0x09
+ #define PON_KPDPWR              0x80            /* in the status and in the interrupt registers */
+ #define PON_RESIN               0x40
++/* ... and the older kind, one block (the PM8150's): linux drivers/input/misc/pm8941-pwrkey.c */
++#define PON_SUBTYPE_GEN1_FIRST  0x01
++#define PON_SUBTYPE_GEN2_LAST   0x05
++#define PON_GEN2_KPDPWR         0x01
++#define PON_GEN2_RESIN          0x02
++
++static uint8_t pon_subtype_from = PON_SUBTYPE_HLOS, pon_subtype_to = PON_SUBTYPE_HLOS;
++static uint8_t pon_kpdpwr = PON_KPDPWR, pon_resin = PON_RESIN;
+ 
+ /* a GPIO of the low or medium voltage kind */
+ #define GPIO_TYPE               0x10
+@@ -277,6 +292,9 @@
+     volume_up = { .name = "volume up", .record = HAKIOS_BUTTON_VOLUME_UP },
+     volume_down = { .name = "volume down", .record = HAKIOS_BUTTON_VOLUME_DOWN };
+ 
++/* which key the power-on block's RESIN input is, and which the PMIC GPIO (the other way round on x01a) */
++static struct button *resin_key = &volume_down, *pin_key = &volume_up;
++
+ /* "12.345 s (08:13:05.918 UTC)": since boot as in the log's own stamps, and as the daemons' lines have it */
+ static void
+ now_text(char *text, size_t size, uint64_t now)
+@@ -333,20 +351,20 @@
+ 	const char *problem;
+ 	uint8_t status;
+ 
+-	if (power.usable || volume_down.usable) {
++	if (power.usable || resin_key->usable) {
+ 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
+ 		if (problem == NULL) {
+-			button_look(&power, status & PON_KPDPWR);
+-			button_look(&volume_down, status & PON_RESIN);
++			button_look(&power, status & pon_kpdpwr);
++			button_look(resin_key, status & pon_resin);
+ 		} else if (said < 8) {
+ 			said++;
+ 			printf("buttons: reading %s: %s\n", pon.name, problem);
+ 		}
+ 	}
+-	if (volume_up.usable) {
++	if (pin_key->usable) {
+ 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
+ 		if (problem == NULL) {
+-			button_look(&volume_up, !(status & GPIO_LEVEL));
++			button_look(pin_key, !(status & GPIO_LEVEL));
+ 		} else if (said < 8) {
+ 			said++;
+ 			printf("buttons: reading %s: %s\n", pin.name, problem);
+@@ -386,7 +404,8 @@
+ 	const char *problem;
+ 	uint8_t r[8], more[2];
+ 
+-	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x1310 to 0x1319)\n", pon.name);
++	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x%02x10 to 0x%02x19)\n", pon.name,
++	    pon.id & 0xff, pon.id & 0xff);
+ 	problem = spmi_read(&pon, REG_RT_STATUS, r, 8);
+ 	if (problem == NULL) {
+ 		problem = spmi_read(&pon, REG_INT_LATCHED, more, 2);
+@@ -395,13 +414,13 @@
+ 		printf("buttons: %s: %s\n", pon.name, problem);
+ 		return;
+ 	}
+-	printf("buttons: power-on block: status %#x (power %s, volume down %s); interrupts: edge %#x, high %#x, low %#x, "
+-	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
+-	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
++	printf("buttons: power-on block: status %#x (power %s, %s %s); interrupts: edge %#x, high %#x, low %#x, "
++	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & pon_kpdpwr) ? "HELD" : "released", resin_key->name,
++	    (r[0] & pon_resin) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
+ 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
+-	power.usable = volume_down.usable = true;
+-	power.last = r[0] & PON_KPDPWR;
+-	volume_down.last = r[0] & PON_RESIN;
++	power.usable = resin_key->usable = true;
++	power.last = r[0] & pon_kpdpwr;
++	resin_key->last = r[0] & pon_resin;
+ }
+ 
+ /* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
+@@ -412,7 +431,8 @@
+ 	uint8_t c[8], status = 0;
+ 	unsigned mode, pull;
+ 
+-	printf("buttons: next: read the setup and the level of %s (registers 0x8d40 to 0x8d47, 0x8d10)\n", pin.name);
++	printf("buttons: next: read the setup and the level of %s (registers 0x%02x40 to 0x%02x47, 0x%02x10)\n", pin.name,
++	    pin.id & 0xff, pin.id & 0xff, pin.id & 0xff);
+ 	problem = spmi_read(&pin, GPIO_REG_MODE, c, 8);
+ 	if (problem == NULL) {
+ 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
+@@ -423,18 +443,18 @@
+ 	}
+ 	mode = c[0] & 3;
+ 	pull = c[GPIO_REG_PULL - GPIO_REG_MODE] & 7;
+-	printf("buttons: volume up's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
+-	    "%02x %02x; level %s\n", mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
++	printf("buttons: %s's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
++	    "%02x %02x; level %s\n", pin_key->name, mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
+ 	    c[GPIO_REG_SUPPLY - GPIO_REG_MODE] & 7, pull, pull < 4 ? "up" : pull == 4 ? "down" : "none",
+ 	    (c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80) ? "enabled" : "DISABLED", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+ 	    (status & GPIO_LEVEL) ? "high (released)" : "LOW (held)");
+ 	if (mode != 0 || pull >= 4 || !(c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80)) {
+-		printf("buttons: volume up's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
+-		    "which this driver does not do: volume up is left alone\n");
++		printf("buttons: %s's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
++		    "which this driver does not do: %s is left alone\n", pin_key->name, pin_key->name);
+ 		return;
+ 	}
+-	volume_up.usable = true;
+-	volume_up.last = !(status & GPIO_LEVEL);
++	pin_key->usable = true;
++	pin_key->last = !(status & GPIO_LEVEL);
+ }
+ 
+ static void
+@@ -453,6 +473,18 @@
+ 	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
+ 	bool pon_known, pin_known;
+ 
++	if (hakios_board_is("x01a")) {
++		pon = x01a_pon;
++		pin = x01a_pin;
++		pon_subtype_from = PON_SUBTYPE_GEN1_FIRST;
++		pon_subtype_to = PON_SUBTYPE_GEN2_LAST;
++		pon_kpdpwr = PON_GEN2_KPDPWR;
++		pon_resin = PON_GEN2_RESIN;
++		resin_key = &volume_up;
++		pin_key = &volume_down;
++		printf("buttons: the BALMUDA Phone: power and volume up on %s, volume down on %s\n", pon.name, pin.name);
++	}
++
+ 	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
+ 	    ARB_OBSERVER_PHYS);
+ 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+@@ -480,7 +512,7 @@
+ 	}
+ 
+ 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
+-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
++	pon_known = identify(&pon, PON_TYPE, pon_subtype_from, pon_subtype_to);
+ 	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
+ 	if (steps < 4) {
+ 		goto out;
+@@ -493,7 +525,7 @@
+ 	if (pin_known) {
+ 		pin_input();
+ 	}
+-	if (!power.usable && !volume_up.usable) {
++	if (!power.usable && !pin_key->usable) {
+ 		printf("buttons: nothing that can be read: no buttons\n");
+ 		goto out;
+ 	}
+--- a/xnu/files/bsd/dev/hakios.input.c
++++ b/xnu/files/bsd/dev/hakios.input.c
+@@ -205,6 +205,14 @@
+ 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+ };
+ 
++bool
++hakios_board_is(const char *name)
++{
++	char board[16];
++
++	return PE_parse_boot_arg_str("hakios_board", board, sizeof(board)) && strcmp(board, name) == 0;
++}
++
+ void
+ hakios_input_init(void)
+ {
+@@ -217,6 +225,7 @@
+ 	hakios_cpufreq_init();
+ 	hakios_virtio_input_init();
+ 	hakios_goodix_init();
++	hakios_ilitek_init();
+ 	hakios_buttons_init();
+ 	hakios_battery_init();
+ 	hakios_ufs_init();
+--- a/xnu/files/bsd/sys/hakios.input.h
++++ b/xnu/files/bsd/sys/hakios.input.h
+@@ -41,6 +41,8 @@
+ void hakios_input_init(void);
+ void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
+ void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
++void hakios_ilitek_init(void);         /* touchscreen=1 with hakios_board=x01a: the BALMUDA Phone's Ilitek touch screen */
++bool hakios_board_is(const char *name);        /* boot-arg hakios_board=NAME (the loader's platform; none: redwood) */
+ void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
+ void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
+ void hakios_ufs_report(const char *when); /* where reading the storage has spent its time so far */
+--- a/xnu/files/bsd/dev/hakios.goodix.c
++++ b/xnu/files/bsd/dev/hakios.goodix.c
+@@ -1508,6 +1508,9 @@
+ 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
+ 		return;
+ 	}
++	if (hakios_board_is("x01a")) {
++		return;         /* the BALMUDA Phone's touch screen is hakios.ilitek.c's */
++	}
+ 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
+ 	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+--- /dev/null
++++ b/xnu/files/bsd/dev/hakios.ilitek.c
+@@ -0,0 +1,764 @@
++/*
++ * The touch screen of the BALMUDA Phone (Kyocera X01A, SM7250 "lito"): the touch half of its
++ * Ilitek ILI7807S display driver, on the I2C bus of the SoC's serial engine 7, as a source of
++ * touches for /dev/hakios-touch (sys/hakios.input.h). Only with boot-arg touchscreen=1 and
++ * hakios_board=x01a (the loader passes the second on this phone): every address below belongs
++ * to it.
++ * The chip runs its firmware from its own flash (the Android driver finds it current and does
++ * not upgrade it), so all this driver does is what that driver does once the firmware is there:
++ *   clocks   the serial engine's three clocks, by vote in the global clock controller
++ *   pins     SDA and SCL (GPIO 6 and 7, function "qup11"), reset (GPIO 8), interrupt (GPIO 9),
++ *            all in the TLMM's west tile
++ *   I2C      the serial engine ("GENI") in FIFO mode, polled, 400 kHz from the 19.2 MHz crystal
++ *   chip     a reset pulse, then 43-byte reads at address 0x41: the "demo mode" report, 0x5A,
++ *            ten fingers of four bytes, a checksum
++ * Nothing is written to the chip: no command, no configuration, no firmware. The interrupt line
++ * is not routed to the interrupt controller; its edge is latched in the TLMM and looked at 250
++ * times a second.
++ * Register layouts: Linux drivers/i2c/busses/i2c-qcom-geni.c and include/linux/qcom-geni-se.h,
++ * drivers/clk/qcom/gcc-lito.c, drivers/pinctrl/qcom/pinctrl-lito.c (downstream msm-4.19), the
++ * Ilitek v3 TDDI driver (ili_report_ap_mode()), the phone's own device tree (i2c@984000,
++ * ilitek@41) and what its Android kernel logs at boot (protocol 5.6.0, coordinates 0 to 2047,
++ * customer type 0x1F, low resolution, 43-byte reports).
++ */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/hakios.input.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern void loader_log_putc(char c);
++
++static int say(const char *format, ...) __printflike(1, 2);
++
++/* (as in hakios.buttons.c: every line into the loader's log as well) */
++static int
++say(const char *format, ...)
++{
++	char line[400];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	return printf("%s", line);
++}
++#define printf say
++
++static vm_offset_t tlmm, gcc, se;
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static void
++sleep_us(uint32_t us)
++{
++	delay_for_interval(us, NSEC_PER_USEC);
++}
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++/* ---- pins (TLMM, west tile) ---------------------------------------------------------------------- */
++
++#define TLMM_WEST_PHYS          0x0f500000UL
++#define TLMM_SIZE               0x10000UL               /* pins 0 to 15 of the tile's numbering: enough */
++#define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
++#define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
++#define GPIO_INTR_CFG(n)        (tlmm + 0x1000UL * (n) + 8)     /* [0] to the GIC, [1] polarity, [3:2] detection, [4] latch */
++#define GPIO_INTR_STATUS(n)     (tlmm + 0x1000UL * (n) + 0xc)   /* bit 0: latched */
++#define PULL_NONE               0
++#define PULL_DOWN               1
++#define INTR_POLARITY_HIGH      (1u << 1)
++#define INTR_DETECT_RISING      (1u << 2)
++#define INTR_RAW_STATUS         (1u << 4)
++
++#define PIN_SDA                 6
++#define PIN_SCL                 7
++#define PIN_RESET               8       /* low = in reset */
++#define PIN_INT                 9       /* a rising edge: the chip has a report */
++#define PIN_FUNCTION_QUP11      1
++
++static void
++gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
++{
++	wr(GPIO_CFG(pin), pull | function << 2 | (ma / 2 - 1) << 6 | (output ? 1u << 9 : 0));
++}
++
++static void
++gpio_set(unsigned pin, bool high)
++{
++	wr(GPIO_IO(pin), high ? 2 : 0);
++}
++
++static bool
++gpio_get(unsigned pin)
++{
++	return rd(GPIO_IO(pin)) & 1;
++}
++
++/* ---- clocks (GCC) -------------------------------------------------------------------------------- */
++
++#define GCC_PHYS                0x00100000UL
++#define GCC_SIZE                0x60000UL
++#define GCC_VOTE                (gcc + 0x52008)         /* the application processor's votes */
++#define VOTE_QUP1_CORE_2X       (1u << 18)
++#define VOTE_QUP1_CORE          (1u << 19)
++#define VOTE_QUP1_M_AHB         (1u << 20)
++#define VOTE_QUP1_S_AHB         (1u << 21)
++#define VOTE_QUP1_SE1           (1u << 23)             /* serial engine 7 is the 2nd of the second group */
++#define GCC_QUP1_M_AHB_CBCR     (gcc + 0x18004)         /* bit 31: the clock is off */
++#define GCC_QUP1_S_AHB_CBCR     (gcc + 0x18008)
++#define GCC_QUP1_SE1_CBCR       (gcc + 0x1813c)
++#define GCC_QUP1_SE1_CMD        (gcc + 0x18140)         /* bit 0: take the new configuration */
++#define GCC_QUP1_SE1_CFG        (gcc + 0x18144)         /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
++#define GCC_QUP1_SE1_DFSR       (gcc + 0x18154)         /* bit 0: the engine chooses among preset rates itself */
++#define GCC_QUP1_SE1_PERF_CFG(l) (gcc + 0x1815c + 4 * (l))
++#define CLOCK_OFF               (1u << 31)
++#define CLOCK_HW_CONTROL        (1u << 1)       /* the hardware gates it while idle: it may read off when it is not */
++
++static uint32_t se_clock_select;
++
++static bool
++clock_running(uint32_t cbcr)
++{
++	return !(cbcr & CLOCK_OFF) || (cbcr & CLOCK_HW_CONTROL);
++}
++
++/* The engine's clock at the crystal's 19.2 MHz, which the I2C timings below are for. */
++static bool
++clocks_on(void)
++{
++	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP1_CORE_2X | VOTE_QUP1_CORE | VOTE_QUP1_M_AHB | VOTE_QUP1_S_AHB);
++	if (rd(GCC_QUP1_SE1_DFSR) & 1) {
++		uint32_t level;
++
++		/* preset rates: the one that is the crystal undivided (source 0, no divider, no M/N) */
++		for (level = 0; level < 8; level++) {
++			if ((rd(GCC_QUP1_SE1_PERF_CFG(level)) & 0x371f) == 0) {
++				break;
++			}
++		}
++		if (level == 8) {
++			printf("ilitek: no preset clock rate of the serial engine is the crystal's\n");
++			return false;
++		}
++		se_clock_select = level;
++	} else {
++		wr(GCC_QUP1_SE1_CFG, rd(GCC_QUP1_SE1_CFG) & ~0x371fu);
++		wr(GCC_QUP1_SE1_CMD, rd(GCC_QUP1_SE1_CMD) | 1);
++		for (int i = 0; i < 500 && (rd(GCC_QUP1_SE1_CMD) & 1); i++) {
++			sleep_us(10);
++		}
++		if (rd(GCC_QUP1_SE1_CMD) & 1) {
++			printf("ilitek: the serial engine's clock does not take its configuration (%#x)\n", rd(GCC_QUP1_SE1_CMD));
++			return false;
++		}
++		se_clock_select = 0;
++	}
++	wr(GCC_VOTE, rd(GCC_VOTE) | VOTE_QUP1_SE1);
++	for (int i = 0; i < 1000; i++) {
++		if (clock_running(rd(GCC_QUP1_M_AHB_CBCR)) && clock_running(rd(GCC_QUP1_S_AHB_CBCR)) &&
++		    clock_running(rd(GCC_QUP1_SE1_CBCR))) {
++			return true;
++		}
++		sleep_us(10);
++	}
++	printf("ilitek: clocks stay off: %#x %#x %#x\n", rd(GCC_QUP1_M_AHB_CBCR), rd(GCC_QUP1_S_AHB_CBCR),
++	    rd(GCC_QUP1_SE1_CBCR));
++	return false;
++}
++
++/* ---- I2C through the serial engine (GENI) ---------------------------------------------------------- */
++
++#define SE_PHYS                 0x00984000UL
++#define SE_SIZE                 0x4000UL
++#define GENI_FORCE_DEFAULT      (se + 0x020)
++#define GENI_OUTPUT_CTRL        (se + 0x024)
++#define GENI_CGC_CTRL           (se + 0x028)
++#define GENI_STATUS             (se + 0x040)    /* bit 0: a command is running */
++#define GENI_SER_M_CLK_CFG      (se + 0x048)    /* bit 0 enable, [15:4] divider */
++#define GENI_IF_DISABLE_RO      (se + 0x064)    /* bit 0: no FIFO interface */
++#define GENI_FW_REVISION_RO     (se + 0x068)    /* [15:8] protocol: 3 = I2C */
++#define GENI_CLK_SEL            (se + 0x07c)
++#define GENI_BYTE_GRAN          (se + 0x254)
++#define GENI_DMA_MODE_EN        (se + 0x258)
++#define GENI_TX_PACKING_CFG0    (se + 0x260)
++#define GENI_TX_PACKING_CFG1    (se + 0x264)
++#define I2C_TX_TRANS_LEN        (se + 0x26c)
++#define I2C_RX_TRANS_LEN        (se + 0x270)
++#define I2C_SCL_COUNTERS        (se + 0x278)    /* [29:20] high, [19:10] low, [9:0] cycle */
++#define GENI_RX_PACKING_CFG0    (se + 0x284)
++#define GENI_RX_PACKING_CFG1    (se + 0x288)
++#define GENI_M_CMD0             (se + 0x600)    /* [31:27] operation, [26:0] its parameters */
++#define GENI_M_CMD_CTRL         (se + 0x604)    /* bit 2 cancel, bit 1 abort */
++#define GENI_M_IRQ_STATUS       (se + 0x610)
++#define GENI_M_IRQ_EN           (se + 0x614)
++#define GENI_M_IRQ_CLEAR        (se + 0x618)
++#define GENI_S_IRQ_CLEAR        (se + 0x648)
++#define GENI_TX_FIFO            (se + 0x700)
++#define GENI_RX_FIFO            (se + 0x780)
++#define GENI_RX_FIFO_STATUS     (se + 0x804)    /* bit 31 last, [30:28] bytes of the last word, [24:0] words */
++#define GENI_TX_WATERMARK       (se + 0x80c)
++#define GENI_RX_WATERMARK       (se + 0x810)
++#define GENI_RX_RFR_WATERMARK   (se + 0x814)
++#define SE_DMA_TX_IRQ_CLR       (se + 0xc44)
++#define SE_DMA_RX_IRQ_CLR       (se + 0xd44)
++#define SE_GSI_EVENT_EN         (se + 0xe18)
++#define SE_IRQ_EN               (se + 0xe1c)
++#define SE_HW_PARAM_0           (se + 0xe24)    /* [21:16] FIFO depth in words */
++#define SE_DMA_GENERAL_CFG      (se + 0xe30)
++
++#define M_CMD_DONE              (1u << 0)
++#define M_CMD_CANCEL            (1u << 4)
++#define M_CMD_ABORT             (1u << 5)
++#define M_GP_NACK               (1u << 10)      /* GP_IRQ1: the address or a byte was not acknowledged */
++#define M_ERRORS                ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 24) | (1u << 25) | (1u << 28) | (1u << 29))
++#define I2C_READ                (2u << 27)
++#define I2C_ADDRESS_SHIFT       9
++
++/* 400 kHz from 19.2 MHz: Linux's geni_i2c_clk_map[] */
++#define I2C_CLOCK_DIVIDER       2
++#define I2C_T_HIGH              5
++#define I2C_T_LOW               12
++#define I2C_T_CYCLE             24
++
++static uint32_t fifo_depth;
++
++/* NULL = ready; otherwise why the engine cannot be used */
++static const char *
++geni_i2c_init(void)
++{
++	uint32_t protocol = rd(GENI_FW_REVISION_RO) >> 8 & 0xff;
++
++	if (protocol != 3) {
++		static char why[64];
++
++		snprintf(why, sizeof(why), "the serial engine has no I2C firmware (protocol %u)", protocol);
++		return why;
++	}
++	if (rd(GENI_IF_DISABLE_RO) & 1) {
++		return "the serial engine's FIFO interface is disabled";
++	}
++	fifo_depth = rd(SE_HW_PARAM_0) >> 16 & 0x3f;
++	if (fifo_depth < 4) {
++		return "the serial engine reports no FIFO";
++	}
++	wr(SE_GSI_EVENT_EN, 0);
++	wr(GENI_M_IRQ_CLEAR, 0xffffffff);
++	wr(GENI_S_IRQ_CLEAR, 0xffffffff);
++	wr(SE_DMA_TX_IRQ_CLR, 0xffffffff);
++	wr(SE_DMA_RX_IRQ_CLR, 0xffffffff);
++	wr(GENI_CGC_CTRL, rd(GENI_CGC_CTRL) | 0x7f);
++	wr(SE_DMA_GENERAL_CFG, rd(SE_DMA_GENERAL_CFG) | 0xf);
++	wr(GENI_OUTPUT_CTRL, 0x7f);
++	wr(GENI_FORCE_DEFAULT, 1);
++	wr(GENI_DMA_MODE_EN, rd(GENI_DMA_MODE_EN) & ~1u);
++	wr(GENI_RX_WATERMARK, fifo_depth - 3);
++	wr(GENI_RX_RFR_WATERMARK, fifo_depth - 2);
++	wr(GENI_TX_WATERMARK, 0);
++	/* the status bits we poll follow these enables; the interrupt itself stays masked at the GIC */
++	wr(SE_IRQ_EN, rd(SE_IRQ_EN) | 0xf);
++	wr(GENI_M_IRQ_EN, rd(GENI_M_IRQ_EN) | 0x7fc0007f | M_GP_NACK);
++	/* bytes of 8 bits, most significant bit first, four to a FIFO word, the first in the lowest byte */
++	wr(GENI_TX_PACKING_CFG0, 0x0007f8fe);
++	wr(GENI_TX_PACKING_CFG1, 0x000ffefe);
++	wr(GENI_RX_PACKING_CFG0, 0x0007f8fe);
++	wr(GENI_RX_PACKING_CFG1, 0x000ffefe);
++	wr(GENI_BYTE_GRAN, 0);
++	wr(GENI_CLK_SEL, se_clock_select & 7);
++	wr(GENI_SER_M_CLK_CFG, I2C_CLOCK_DIVIDER << 4 | 1);
++	wr(I2C_SCL_COUNTERS, I2C_T_HIGH << 20 | I2C_T_LOW << 10 | I2C_T_CYCLE);
++	return NULL;
++}
++
++static void
++geni_drain(uint8_t *rx, uint32_t length, uint32_t *received)
++{
++	uint32_t status = rd(GENI_RX_FIFO_STATUS), words = status & 0x01ffffff, bytes = words * 4;
++
++	if (status & 0x80000000u) {
++		uint32_t valid = status >> 28 & 7;
++
++		if (valid && valid < 4) {
++			bytes -= 4 - valid;
++		}
++	}
++	for (uint32_t i = 0; i < words; i++) {
++		uint32_t word = rd(GENI_RX_FIFO);
++
++		for (int j = 0; j < 4 && bytes; j++, bytes--) {
++			if (*received < length) {
++				rx[(*received)++] = (uint8_t)(word >> (8 * j));
++			}
++		}
++	}
++}
++
++static void
++geni_recover(void)
++{
++	wr(GENI_M_CMD_CTRL, 1u << 2);
++	for (int i = 0; i < 2000 && !(rd(GENI_M_IRQ_STATUS) & M_CMD_CANCEL); i++) {
++		sleep_us(100);
++	}
++	if (!(rd(GENI_M_IRQ_STATUS) & M_CMD_CANCEL)) {
++		wr(GENI_M_CMD_CTRL, 1u << 1);
++		for (int i = 0; i < 2000 && !(rd(GENI_M_IRQ_STATUS) & M_CMD_ABORT); i++) {
++			sleep_us(100);
++		}
++	}
++	for (int i = 0; i < 64 && (rd(GENI_RX_FIFO_STATUS) & 0x01ffffff); i++) {
++		(void)rd(GENI_RX_FIFO);
++	}
++	wr(GENI_M_IRQ_CLEAR, 0xffffffff);
++}
++
++static struct {
++	uint64_t reads, failed, nacked;
++} bus;
++
++/* An I2C read of `length` bytes from `address`. */
++static bool
++i2c_read(uint8_t address, uint8_t *rx, uint32_t length)
++{
++	static unsigned complaints;
++	uint32_t received = 0, status = 0;
++	uint64_t deadline;
++
++	bus.reads++;
++	for (int i = 0; rd(GENI_STATUS) & 1; i++) {
++		if (i > 200) {
++			geni_recover();
++			break;
++		}
++		sleep_us(100);
++	}
++	wr(GENI_M_IRQ_CLEAR, 0xffffffff);
++	wr(I2C_RX_TRANS_LEN, length);
++	wr(GENI_M_CMD0, I2C_READ | (uint32_t)(address & 0x7f) << I2C_ADDRESS_SHIFT);
++	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		status = rd(GENI_M_IRQ_STATUS);
++		geni_drain(rx, length, &received);
++		if (status & (M_ERRORS | M_GP_NACK)) {
++			break;
++		}
++		if (status & M_CMD_DONE) {
++			geni_drain(rx, length, &received);
++			wr(GENI_M_IRQ_CLEAR, status);
++			if (received == length) {
++				return true;
++			}
++			break;
++		}
++	}
++	bus.failed++;
++	if (status & M_GP_NACK) {
++		bus.nacked++;
++	}
++	if (complaints++ < 8) {
++		printf("ilitek: I2C read of %u bytes from %#x failed: status %#x%s, received %u\n", length, address, status,
++		    (status & M_GP_NACK) ? " (not acknowledged)" : (status & (M_CMD_DONE | M_ERRORS)) ? "" : " (timed out)", received);
++	}
++	geni_recover();
++	return false;
++}
++
++/* ---- I2C by hand, on the same pins ------------------------------------------------------------------- */
++
++/*
++ * The serial engine of this bus is set up by the firmware for GPI DMA only (its FIFO interface is
++ * disabled), which is a DMA engine of its own to drive. Until then, the two pins as GPIOs: a line
++ * is low by driving it to 0 and high by letting go of it (the bus has its pull-ups on the board:
++ * the device tree has no bias on these pins). About 150 kHz; the chip may stretch the clock.
++ */
++#define BB_HALF_NS              2500
++#define BB_STRETCH_US           2000
++
++static void
++bb_wait(uint32_t ns)
++{
++	uint64_t interval, start = mach_absolute_time();
++
++	nanoseconds_to_absolutetime(ns, &interval);
++	while (mach_absolute_time() - start < interval) {
++	}
++}
++
++static void
++bb_line(unsigned pin, bool high)
++{
++	if (high) {
++		gpio_configure(pin, 0, PULL_NONE, 2, false);
++	} else {
++		gpio_set(pin, false);
++		gpio_configure(pin, 0, PULL_NONE, 2, true);
++	}
++}
++
++/* SCL let go of, and waited for: the chip may hold it low while it gets ready */
++static bool
++bb_scl_high(void)
++{
++	uint64_t interval, start = mach_absolute_time();
++
++	bb_line(PIN_SCL, true);
++	nanoseconds_to_absolutetime(BB_STRETCH_US * (uint64_t)NSEC_PER_USEC, &interval);
++	while (!gpio_get(PIN_SCL)) {
++		if (mach_absolute_time() - start > interval) {
++			return false;
++		}
++	}
++	bb_wait(BB_HALF_NS);
++	return true;
++}
++
++static void
++bb_scl_low(void)
++{
++	bb_line(PIN_SCL, false);
++	bb_wait(BB_HALF_NS);
++}
++
++static void
++bb_start(void)
++{
++	bb_line(PIN_SDA, true);
++	bb_scl_high();
++	bb_line(PIN_SDA, false);
++	bb_wait(BB_HALF_NS);
++	bb_scl_low();
++}
++
++static void
++bb_stop(void)
++{
++	bb_line(PIN_SDA, false);
++	bb_wait(BB_HALF_NS);
++	bb_scl_high();
++	bb_line(PIN_SDA, true);
++	bb_wait(BB_HALF_NS);
++}
++
++/* a byte out; true if the chip acknowledged it */
++static bool
++bb_write_byte(uint8_t byte)
++{
++	bool ack;
++
++	for (int bit = 7; bit >= 0; bit--) {
++		bb_line(PIN_SDA, byte >> bit & 1);
++		bb_wait(BB_HALF_NS / 2);
++		if (!bb_scl_high()) {
++			return false;
++		}
++		bb_scl_low();
++	}
++	bb_line(PIN_SDA, true);
++	bb_wait(BB_HALF_NS / 2);
++	if (!bb_scl_high()) {
++		return false;
++	}
++	ack = !gpio_get(PIN_SDA);
++	bb_scl_low();
++	return ack;
++}
++
++static bool
++bb_read_byte(uint8_t *byte, bool last)
++{
++	uint8_t in = 0;
++
++	bb_line(PIN_SDA, true);
++	for (int bit = 7; bit >= 0; bit--) {
++		if (!bb_scl_high()) {
++			return false;
++		}
++		in = (uint8_t)(in << 1 | gpio_get(PIN_SDA));
++		bb_scl_low();
++	}
++	bb_line(PIN_SDA, last);         /* acknowledge all but the last */
++	bb_wait(BB_HALF_NS / 2);
++	if (!bb_scl_high()) {
++		return false;
++	}
++	bb_scl_low();
++	bb_line(PIN_SDA, true);
++	*byte = in;
++	return true;
++}
++
++/* a bus that a reset in the middle of a transfer left with SDA held: clock it free, then a stop */
++static void
++bb_recover(void)
++{
++	bb_line(PIN_SDA, true);
++	bb_line(PIN_SCL, true);
++	bb_wait(BB_HALF_NS);
++	for (int i = 0; i < 9 && !gpio_get(PIN_SDA); i++) {
++		bb_scl_low();
++		bb_scl_high();
++	}
++	bb_stop();
++}
++
++static bool
++bb_i2c_read(uint8_t address, uint8_t *rx, uint32_t length)
++{
++	static unsigned complaints;
++	bool ok;
++
++	bus.reads++;
++	bb_start();
++	ok = bb_write_byte((uint8_t)(address << 1 | 1));
++	if (!ok) {
++		bus.nacked++;
++	}
++	for (uint32_t i = 0; ok && i < length; i++) {
++		ok = bb_read_byte(&rx[i], i + 1 == length);
++	}
++	bb_stop();
++	if (!ok) {
++		bus.failed++;
++		if (complaints++ < 8) {
++			printf("ilitek: I2C read (by hand) of %u bytes from %#x failed (SDA %u, SCL %u)\n", length, address,
++			    gpio_get(PIN_SDA), gpio_get(PIN_SCL));
++		}
++		bb_recover();
++	}
++	return ok;
++}
++
++static bool (*read_chip)(uint8_t address, uint8_t *rx, uint32_t length) = i2c_read;
++
++/* ---- the chip's reports ---------------------------------------------------------------------------- */
++
++#define ILITEK_ADDRESS          0x41
++#define REPORT_LENGTH           43
++#define REPORT_DEMO             0x5a            /* a touch report ("demo mode") */
++#define FINGERS                 10
++#define COORDINATE_MAX          2047            /* both axes; the panel's 1080 x 1920 is applied by the reader */
++#define POLL_MS                 4
++
++static struct {
++	bool down;
++	uint32_t x, y;
++} contact[FINGERS];
++
++static struct {
++	uint64_t reports, bad_checksum, other_id, edges, touches;
++} seen;
++
++static uint32_t flip;
++
++static void
++report(const uint8_t *r)
++{
++	static unsigned shown;
++	uint8_t sum = 0;
++
++	for (int i = 0; i < REPORT_LENGTH - 1; i++) {
++		sum += r[i];
++	}
++	if ((uint8_t)(sum + r[REPORT_LENGTH - 1]) != 0) {
++		seen.bad_checksum++;
++		return;
++	}
++	if (r[0] != REPORT_DEMO) {
++		seen.other_id++;
++		return;
++	}
++	seen.reports++;
++	for (uint32_t id = 0; id < FINGERS; id++) {
++		const uint8_t *t = r + 1 + 4 * id;
++		uint32_t x, y;
++
++		if (t[0] == 0xff && t[1] == 0xff && t[2] == 0xff) {
++			if (contact[id].down) {
++				contact[id].down = false;
++				hakios_touch_post(HAKIOS_TOUCH_UP, id, contact[id].x, contact[id].y);
++			}
++			continue;
++		}
++		x = (uint32_t)(t[0] & 0xf0) << 4 | t[1];
++		y = (uint32_t)(t[0] & 0x0f) << 8 | t[2];
++		if (shown < 40) {
++			shown++;
++			printf("ilitek: finger %u at %u, %u (of %u), pressure %u\n", id, x, y, COORDINATE_MAX, t[3]);
++		}
++		seen.touches++;
++		x = x >= COORDINATE_MAX ? 65535 : x * 65535 / COORDINATE_MAX;
++		y = y >= COORDINATE_MAX ? 65535 : y * 65535 / COORDINATE_MAX;
++		if (flip & 1) {
++			x = 65535 - x;
++		}
++		if (flip & 2) {
++			y = 65535 - y;
++		}
++		if (!contact[id].down) {
++			hakios_touch_post(HAKIOS_TOUCH_DOWN, id, x, y);
++		} else if (contact[id].x != x || contact[id].y != y) {
++			hakios_touch_post(HAKIOS_TOUCH_MOVE, id, x, y);
++		}
++		contact[id].down = true;
++		contact[id].x = x;
++		contact[id].y = y;
++	}
++}
++
++static void
++hex_line(const char *what, const uint8_t *bytes, uint32_t length)
++{
++	char line[3 * REPORT_LENGTH + 1];
++	uint32_t n = 0;
++
++	for (uint32_t i = 0; i < length && n + 3 < sizeof(line); i++) {
++		n += snprintf(line + n, sizeof(line) - n, "%02x ", bytes[i]);
++	}
++	printf("ilitek: %s: %s\n", what, line);
++}
++
++/* ---- all of it together ---------------------------------------------------------------------------- */
++
++static void
++ilitek_thread(void *parameter, __unused wait_result_t result)
++{
++	uint32_t steps = (uint32_t)(uintptr_t)parameter;
++	uint8_t r[REPORT_LENGTH];
++	const char *problem;
++	unsigned raw_shown = 0;
++
++	printf("ilitek: step 1: map the TLMM's west tile, the clock controller and serial engine 7 (%#lx, %#lx, %#lx)\n",
++	    TLMM_WEST_PHYS, GCC_PHYS, SE_PHYS);
++	tlmm = ml_io_map(TLMM_WEST_PHYS, TLMM_SIZE);
++	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	se = ml_io_map(SE_PHYS, SE_SIZE);
++	printf("ilitek: pins as the firmware left them: SDA cfg %#x, SCL cfg %#x, reset cfg %#x level %u, interrupt cfg %#x "
++	    "level %u\n", rd(GPIO_CFG(PIN_SDA)), rd(GPIO_CFG(PIN_SCL)), rd(GPIO_CFG(PIN_RESET)), gpio_get(PIN_RESET),
++	    rd(GPIO_CFG(PIN_INT)), gpio_get(PIN_INT));
++	printf("ilitek: clock votes %#x; serial engine clock %#x, its rate %s\n", rd(GCC_VOTE), rd(GCC_QUP1_SE1_CBCR),
++	    (rd(GCC_QUP1_SE1_DFSR) & 1) ? "from preset levels" : "configured directly");
++	if (steps < 2) {
++		goto out;
++	}
++
++	printf("ilitek: step 2: the serial engine's clocks on, at the crystal's rate\n");
++	if (!clocks_on()) {
++		goto out;
++	}
++	printf("ilitek: clocks on (level %u); the engine's firmware revision %#x\n", se_clock_select, rd(GENI_FW_REVISION_RO));
++	if (steps < 3) {
++		goto out;
++	}
++
++	printf("ilitek: step 3: the pins: SDA and SCL to the engine, the interrupt line in with its edge latched, reset out\n");
++	gpio_configure(PIN_INT, 0, PULL_DOWN, 2, false);
++	wr(GPIO_INTR_CFG(PIN_INT), (rd(GPIO_INTR_CFG(PIN_INT)) & ~0x1fu) | INTR_RAW_STATUS | INTR_DETECT_RISING |
++	    INTR_POLARITY_HIGH);
++	wr(GPIO_INTR_STATUS(PIN_INT), 0);
++	problem = geni_i2c_init();
++	if (problem == NULL) {
++		gpio_configure(PIN_SDA, PIN_FUNCTION_QUP11, PULL_NONE, 2, false);
++		gpio_configure(PIN_SCL, PIN_FUNCTION_QUP11, PULL_NONE, 2, false);
++		printf("ilitek: the engine is set up for I2C at 400 kHz (FIFO of %u words)\n", fifo_depth);
++	} else {
++		read_chip = bb_i2c_read;
++		bb_recover();
++		printf("ilitek: %s: I2C by hand on GPIO %u and %u instead (SDA %u, SCL %u with both let go of)\n", problem,
++		    PIN_SDA, PIN_SCL, gpio_get(PIN_SDA), gpio_get(PIN_SCL));
++	}
++	if (steps < 4) {
++		goto out;
++	}
++
++	printf("ilitek: step 4: a reset pulse (as the Android driver's ili_tp_reset()), then a first report read\n");
++	gpio_set(PIN_RESET, true);
++	gpio_configure(PIN_RESET, 0, PULL_NONE, 2, true);
++	sleep_ms(1);
++	gpio_set(PIN_RESET, false);
++	sleep_ms(5);
++	gpio_set(PIN_RESET, true);
++	sleep_ms(100);
++	wr(GPIO_INTR_STATUS(PIN_INT), 0);
++	if (read_chip(ILITEK_ADDRESS, r, REPORT_LENGTH)) {
++		hex_line("the first read", r, REPORT_LENGTH);
++	} else {
++		printf("ilitek: the chip does not answer at %#x\n", ILITEK_ADDRESS);
++	}
++	if (steps < 5) {
++		goto out;
++	}
++
++	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
++	printf("ilitek: step 5: watching the interrupt line every %u ms%s\n", POLL_MS, flip ? " (flipped)" : "");
++	for (unsigned tick = 1;; tick++) {
++		bool edge = rd(GPIO_INTR_STATUS(PIN_INT)) & 1;
++
++		if (edge || gpio_get(PIN_INT)) {
++			if (edge) {
++				seen.edges++;
++				wr(GPIO_INTR_STATUS(PIN_INT), 0);
++			}
++			if (read_chip(ILITEK_ADDRESS, r, REPORT_LENGTH)) {
++				if (raw_shown < 12) {
++					raw_shown++;
++					hex_line("report", r, REPORT_LENGTH);
++				}
++				report(r);
++			}
++		}
++		if (tick % (60 * 1000 / POLL_MS) == 0 || tick == 10 * 1000 / POLL_MS) {
++			printf("ilitek: so far %llu edges, %llu reports (%llu touches), %llu bad checksums, %llu of another kind; "
++			    "%llu reads, %llu failed (%llu not acknowledged)\n", seen.edges, seen.reports, seen.touches,
++			    seen.bad_checksum, seen.other_id, bus.reads, bus.failed, bus.nacked);
++		}
++		if (bus.failed >= 1000 && bus.failed * 2 > bus.reads) {
++			printf("ilitek: more than half of %llu reads have failed: giving up\n", bus.reads);
++			break;
++		}
++		sleep_ms(POLL_MS);
++	}
++out:
++	if (steps < 5) {
++		printf("ilitek: stopping here (touch_steps=%u)\n", steps);
++	}
++	thread_terminate(current_thread());
++}
++
++void
++hakios_ilitek_init(void)
++{
++	uint32_t enabled = 0, steps = 5;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || enabled == 0 || !hakios_board_is("x01a")) {
++		return;
++	}
++	PE_parse_boot_argn("touch_steps", &steps, sizeof(steps));
++	if (steps == 0) {
++		return;
++	}
++	if (kernel_thread_start(ilitek_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}

@@ -1,0 +1,98 @@
+diff --git a/loader.c b/loader.c
+old mode 100755
+new mode 100644
+index ab5a781..8fe1abc
+--- a/loader.c
++++ b/loader.c
+@@ -524,6 +524,7 @@ struct platform {
+ 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
+ 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
+ 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
++	const char *kernel_args;         /* put on the kernel's command line for this platform, or NULL */
+ };
+ 
+ static const struct platform platform_qemu_virt = {
+@@ -551,6 +552,23 @@ static const struct platform platform_redwood = {
+ 	.small_cores = 0x0f,
+ };
+ 
++static const struct platform platform_x01a = {
++	/*
++	 * BALMUDA Phone (SM7250, lito): the same GIC addresses and the same core numbering (MPIDR
++	 * affinity 1, CPU0 is 0x81000000) as redwood, from the phone's own device tree.
++	 */
++	.name = "x01a", .io_base = 0x00400000, .io_size = 0x3FC00000,
++	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
++	.cores = 8, .core_shift = 8,
++	/* Cores 0-5 are Kryo 475 Silver (Cortex-A55, 1.8 GHz), 6-7 Kryo 475 Gold (Cortex-A76, 2.2/2.3 GHz). */
++	.small_cores = 0x3f,
++	/*
++	 * The architected timer is on PPIs 1, 2, 3, 0 here: the virtual one is INTID 19, not 27. And
++	 * the board's drivers are told which phone this is (touch screen and keys: hakios_board_is()).
++	 */
++	.kernel_args = "vtimer_intid=19 hakios_board=x01a ",
++};
++
+ /* ------------------------------------------------------------------------ */
+ 
+ static void
+@@ -2432,7 +2450,7 @@ wdt_arm(void)
+ {
+ 	uint64_t ctl = 0, since = 0;
+ 
+-	if (PLAT != &platform_redwood) {
++	if (PLAT != &platform_redwood && PLAT != &platform_x01a) {
+ 		return; /* SMC is not routed anywhere useful on QEMU virt */
+ 	}
+ 	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);
+@@ -2977,6 +2995,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 			ba->commandLine[n++] = *c;
+ 		}
+ 	}
++	if (PLAT->kernel_args != NULL) {
++		for (const char *c = PLAT->kernel_args; *c && n < BOOT_LINE_LENGTH - 1; c++) {
++			ba->commandLine[n++] = *c;
++		}
++	}
+ 	if (wdt_armed) {
+ 		for (const char *c = "hv_wdt_pet=1 "; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+ 			ba->commandLine[n++] = *c;
+@@ -3696,6 +3719,29 @@ fb_command(char *cmd)
+ 			staged_data = (const char *)(uintptr_t)SCREEN.base;
+ 			staged_len = (uint64_t)SCREEN.stride * SCREEN.height;
+ 			fb_reply("OKAY", "");
++		} else if (starts_with(cmd, "oem peek ")) {
++			/*
++			 * X01A: stage raw memory, "oem peek ADDR LEN" (hex). With no core for the loader to
++			 * watch the kernel from, this is how a hung kernel's log is read back after the reset,
++			 * if the RAM kept it.
++			 */
++			const char *a = cmd + 9;
++			uint64_t addr = parse_number(a, 16), len;
++
++			while (*a != ' ' && *a != 0) {
++				a++;
++			}
++			while (*a == ' ') {
++				a++;
++			}
++			len = parse_number(a, 16);
++			if (len == 0 || len > 0x4000000) {
++				fb_reply("FAIL", "usage: oem peek ADDR LEN (hex, LEN up to 4000000)");
++				return;
++			}
++			staged_data = (const char *)(uintptr_t)addr;
++			staged_len = len;
++			fb_reply("OKAY", "");
+ 		} else if (starts_with(cmd, "oem recording")) {
+ 			/* stage what the kernel's display driver recorded (boot-arg rec_secs) */
+ 			if (recording_data == NULL) {
+@@ -3932,6 +3978,8 @@ efi_main(efi_handle image, efi_system_table *st)
+ 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
+ 		if (SCREEN.base == 0xE1000000ULL) {
+ 			PLAT = &platform_redwood;
++		} else if (SCREEN.base == 0xA0000000ULL && SCREEN.width == 1080 && SCREEN.height == 1920) {
++			PLAT = &platform_x01a;          /* the boot splash ABL leaves in "Display Reserved" */
+ 		} else {
+ 			ramfb_phone_screen();
+ 		}
