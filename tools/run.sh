@@ -13,6 +13,14 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 H=$(cd "$1" && pwd)
 SECS=${2:-240}
 ARGS=${ARGS:-cpus=8 touchscreen=1 buttons=1 battery=1}
+# The kernel's boot-args hold 607 characters, and the loader puts about 95 of its own in front
+# (debug, rd, vtimer_intid, hakios_board, fb_fit, ufs_shared_pa). What doesn't fit is cut off the
+# end without a word: that once dropped modem_ipa=0, and the phone hung.
+CMDLINE="loader_return_after=$SECS epoch=0000000000 sb_delay=8 $ARGS"
+if [ ${#CMDLINE} -gt 500 ]; then
+	echo "run.sh: the arguments are ${#CMDLINE} characters, more than the 500 that fit after the loader's own: shorten them"
+	exit 1
+fi
 KERNEL=${KERNEL:-$H/xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837}
 # (on Windows "python3" can be the Store's stand-in, which only says it is not installed)
 for PY in python3 python py ""; do

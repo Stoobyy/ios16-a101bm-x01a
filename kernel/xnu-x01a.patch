@@ -1,137 +1,8 @@
---- a/xnu/files/osfmk/arm64/gic_v3_irq.c
-+++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
-@@ -72,7 +72,14 @@
- 
- #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
- #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
--#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
-+/*
-+ * EL1 virtual timer PPI: 27 on redwood, as the architecture suggests, but the SoC decides. On the
-+ * BALMUDA Phone (SM7250) its device tree has the timer on PPI 3, INTID 19. Boot-arg vtimer_intid=N
-+ * (16 to 31) says which; the loader passes it for the phones that need it.
-+ */
-+static uint32_t gic_intid_vtimer = 27;
-+static bool gic_vtimer_from_bootarg;    /* (then the timer is the kernel's alone, and goes quiet on the way back) */
-+#define GIC_INTID_VTIMER        gic_intid_vtimer
- #define GIC_INTID_SPI_MIN       32
- #define GIC_INTID_SPURIOUS_MIN  1020
- #define GIC_SPI_MOST            48          /* attached at a time */
-@@ -362,6 +369,16 @@
- 		__builtin_arm_isb(ISB_SY);
- 		gic_active_iar[cpu] = 0;
- 	}
-+	/*
-+	 * A timer on a PPI the firmware does not own (vtimer_intid=, the BALMUDA Phone's 19) must not
-+	 * go on firing under it: UEFI's GIC driver takes it, calls it spurious, and takes it again.
-+	 */
-+	if (gic_vtimer_from_bootarg && gicr_cpu_base[cpu] != 0) {
-+		__builtin_arm_wsr64("CNTV_CTL_EL0", 0);
-+		__builtin_arm_isb(ISB_SY);
-+		gic_write32(gicr_cpu_base[cpu] + GICR_ICENABLER0, 1u << GIC_INTID_VTIMER);
-+		gic_write32(gicr_cpu_base[cpu] + GICR_ICPENDR0, 1u << GIC_INTID_VTIMER);
-+	}
- }
- 
- /*
-@@ -418,6 +435,13 @@
- {
- 	int cpu = cpu_number();
- 	vm_offset_t gicr;
-+	uint32_t intid;
-+
-+	if (cpu == 0 && PE_parse_boot_argn("vtimer_intid", &intid, sizeof(intid)) && intid >= 16 && intid < 32) {
-+		gic_intid_vtimer = intid;
-+		gic_vtimer_from_bootarg = true;
-+	}
-+
- 	uint32_t mine = 1u << GIC_INTID_VTIMER;
- 
- 	if (gicd_base == 0) {
---- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
-+++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
-@@ -111,6 +111,15 @@
- #define kFBPointsHigh           812
- #define kFBDefaultScale         3
- static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
-+/*
-+ * Boot-arg fb_fit=1: the display in its own proportions, centred, instead of stretched to fill the
-+ * panel (the BALMUDA Phone's 1080 x 1920 against the iPhone X's 1125 x 2436: 887 x 1920 in the
-+ * middle, black at the sides). The touch screen's driver maps into the same rectangle.
-+ */
-+static TUNABLE(uint32_t, gFit, "fb_fit", 0);
-+/* x, y, width, height of the display on the panel, then the panel's width and height (0: not yet) */
-+extern "C" uint32_t hakios_fb_view[6];
-+uint32_t hakios_fb_view[6];
- /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
- static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
- 
-@@ -229,6 +238,7 @@
- 	IOLock *        fLock;
- 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
- 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
-+	uint32_t        fViewX, fViewY, fViewWidth, fViewHeight;        /* where on the panel the display goes */
- 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
- 	MiniIOSurface * fDefaultSurface;
- 	uint32_t        fSwapID;
-@@ -439,12 +449,38 @@
- 			}
- 		}
- 	}
-+	fViewX = fViewY = 0;
-+	fViewWidth = fPanelWidth;
-+	fViewHeight = fPanelHeight;
-+	if (gFit != 0 && (uint64_t) fWidth * fPanelHeight != (uint64_t) fHeight * fPanelWidth) {
-+		/* the display's own proportions, as large as the panel allows, in the middle; the rest black */
-+		if ((uint64_t) fWidth * fPanelHeight < (uint64_t) fHeight * fPanelWidth) {
-+			fViewWidth = (uint32_t) ((uint64_t) fWidth * fPanelHeight / fHeight);
-+			fViewX = (fPanelWidth - fViewWidth) / 2;
-+		} else {
-+			fViewHeight = (uint32_t) ((uint64_t) fHeight * fPanelWidth / fWidth);
-+			fViewY = (fPanelHeight - fViewHeight) / 2;
-+		}
-+		for (uint32_t y = 0; y < fPanelHeight; y++) {
-+			bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
-+		}
-+	}
-+	hakios_fb_view[0] = fViewX;
-+	hakios_fb_view[1] = fViewY;
-+	hakios_fb_view[2] = fViewWidth;
-+	hakios_fb_view[3] = fViewHeight;
-+	hakios_fb_view[4] = fPanelWidth;
-+	hakios_fb_view[5] = fPanelHeight;
- 	fColumn = IONewZero(uint32_t, fPanelWidth);
- 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
- 	fDiff = gDiff != 0;
- 	fDiffLeft = fDiffTop = ~0u;
--	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
--	    fPanelWidth, fPanelHeight, fRowBytes);
-+	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)%s\n", fWidth, fHeight,
-+	    fPanelWidth, fPanelHeight, fRowBytes, fViewWidth != fPanelWidth || fViewHeight != fPanelHeight ? "" : ", filling it");
-+	if (fViewWidth != fPanelWidth || fViewHeight != fPanelHeight) {
-+		IOLog("MiniIOMobileFramebuffer: in its own proportions (fb_fit): %ux%u at %u,%u of the panel\n", fViewWidth,
-+		    fViewHeight, fViewX, fViewY);
-+	}
- 
- 	if (gRecSeconds != 0) {
- 		/* one piece of physical memory: the loader will send it over USB as it lies */
-@@ -739,10 +775,10 @@
- 		return;
- 	}
- 	/* the rectangle on the panel */
--	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
--	py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
--	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
--	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
-+	px0 = (int32_t) (fViewX + (int64_t) dx * fViewWidth / fWidth);
-+	py0 = (int32_t) (fViewY + (int64_t) dy * fViewHeight / fHeight);
-+	px1 = (int32_t) (fViewX + (int64_t) (dx + dw) * fViewWidth / fWidth);
-+	py1 = (int32_t) (fViewY + (int64_t) (dy + dh) * fViewHeight / fHeight);
- 	if (px1 <= px0 || py1 <= py0) {
- 		return;
- 	}
+diff --git a/xnu/files/bsd/dev/hakios.buttons.c b/xnu/files/bsd/dev/hakios.buttons.c
+index 94dbbd5..05c06fb 100644
 --- a/xnu/files/bsd/dev/hakios.buttons.c
 +++ b/xnu/files/bsd/dev/hakios.buttons.c
-@@ -151,6 +151,13 @@
+@@ -151,6 +151,13 @@ struct peripheral {
  };
  static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
  static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
@@ -145,7 +16,7 @@
  
  /* How the reads have gone: said once a minute. */
  static struct {
-@@ -250,6 +257,14 @@
+@@ -250,6 +257,14 @@ find_channel(struct peripheral *p, uint32_t channels)
  #define PON_SUBTYPE_HLOS        0x09
  #define PON_KPDPWR              0x80            /* in the status and in the interrupt registers */
  #define PON_RESIN               0x40
@@ -160,7 +31,7 @@
  
  /* a GPIO of the low or medium voltage kind */
  #define GPIO_TYPE               0x10
-@@ -277,6 +292,9 @@
+@@ -277,6 +292,9 @@ static struct button {
      volume_up = { .name = "volume up", .record = HAKIOS_BUTTON_VOLUME_UP },
      volume_down = { .name = "volume down", .record = HAKIOS_BUTTON_VOLUME_DOWN };
  
@@ -170,7 +41,7 @@
  /* "12.345 s (08:13:05.918 UTC)": since boot as in the log's own stamps, and as the daemons' lines have it */
  static void
  now_text(char *text, size_t size, uint64_t now)
-@@ -333,20 +351,20 @@
+@@ -333,20 +351,20 @@ buttons_poll(void)
  	const char *problem;
  	uint8_t status;
  
@@ -196,7 +67,7 @@
  		} else if (said < 8) {
  			said++;
  			printf("buttons: reading %s: %s\n", pin.name, problem);
-@@ -386,7 +404,8 @@
+@@ -386,7 +404,8 @@ pon_inputs(void)
  	const char *problem;
  	uint8_t r[8], more[2];
  
@@ -206,7 +77,7 @@
  	problem = spmi_read(&pon, REG_RT_STATUS, r, 8);
  	if (problem == NULL) {
  		problem = spmi_read(&pon, REG_INT_LATCHED, more, 2);
-@@ -395,13 +414,13 @@
+@@ -395,13 +414,13 @@ pon_inputs(void)
  		printf("buttons: %s: %s\n", pon.name, problem);
  		return;
  	}
@@ -226,7 +97,7 @@
  }
  
  /* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
-@@ -412,7 +431,8 @@
+@@ -412,7 +431,8 @@ pin_input(void)
  	uint8_t c[8], status = 0;
  	unsigned mode, pull;
  
@@ -236,7 +107,7 @@
  	problem = spmi_read(&pin, GPIO_REG_MODE, c, 8);
  	if (problem == NULL) {
  		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
-@@ -423,18 +443,18 @@
+@@ -423,18 +443,18 @@ pin_input(void)
  	}
  	mode = c[0] & 3;
  	pull = c[GPIO_REG_PULL - GPIO_REG_MODE] & 7;
@@ -261,7 +132,7 @@
  }
  
  static void
-@@ -453,6 +473,18 @@
+@@ -453,6 +473,18 @@ buttons_thread(void *parameter, __unused wait_result_t result)
  	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
  	bool pon_known, pin_known;
  
@@ -280,7 +151,7 @@
  	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
  	    ARB_OBSERVER_PHYS);
  	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
-@@ -480,7 +512,7 @@
+@@ -480,7 +512,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
  	}
  
  	printf("buttons: step 3: the first transfers on the SPMI bus\n");
@@ -289,7 +160,7 @@
  	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
  	if (steps < 4) {
  		goto out;
-@@ -493,7 +525,7 @@
+@@ -493,7 +525,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
  	if (pin_known) {
  		pin_input();
  	}
@@ -298,45 +169,11 @@
  		printf("buttons: nothing that can be read: no buttons\n");
  		goto out;
  	}
---- a/xnu/files/bsd/dev/hakios.input.c
-+++ b/xnu/files/bsd/dev/hakios.input.c
-@@ -205,6 +205,14 @@
- 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
- };
- 
-+bool
-+hakios_board_is(const char *name)
-+{
-+	char board[16];
-+
-+	return PE_parse_boot_arg_str("hakios_board", board, sizeof(board)) && strcmp(board, name) == 0;
-+}
-+
- void
- hakios_input_init(void)
- {
-@@ -217,6 +225,7 @@
- 	hakios_cpufreq_init();
- 	hakios_virtio_input_init();
- 	hakios_goodix_init();
-+	hakios_ilitek_init();
- 	hakios_buttons_init();
- 	hakios_battery_init();
- 	hakios_ufs_init();
---- a/xnu/files/bsd/sys/hakios.input.h
-+++ b/xnu/files/bsd/sys/hakios.input.h
-@@ -41,6 +41,8 @@
- void hakios_input_init(void);
- void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
- void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
-+void hakios_ilitek_init(void);         /* touchscreen=1 with hakios_board=x01a: the BALMUDA Phone's Ilitek touch screen */
-+bool hakios_board_is(const char *name);        /* boot-arg hakios_board=NAME (the loader's platform; none: redwood) */
- void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
- void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
- void hakios_ufs_report(const char *when); /* where reading the storage has spent its time so far */
+diff --git a/xnu/files/bsd/dev/hakios.goodix.c b/xnu/files/bsd/dev/hakios.goodix.c
+index 867b463..ed35f01 100644
 --- a/xnu/files/bsd/dev/hakios.goodix.c
 +++ b/xnu/files/bsd/dev/hakios.goodix.c
-@@ -1508,6 +1508,9 @@
+@@ -1508,6 +1508,9 @@ hakios_goodix_init(void)
  	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
  		return;
  	}
@@ -346,6 +183,9 @@
  	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
  	if (kernel_thread_start(goodix_thread, NULL, &thread) == KERN_SUCCESS) {
  		thread_deallocate(thread);
+diff --git a/xnu/files/bsd/dev/hakios.ilitek.c b/xnu/files/bsd/dev/hakios.ilitek.c
+new file mode 100644
+index 0000000..26c1edf
 --- /dev/null
 +++ b/xnu/files/bsd/dev/hakios.ilitek.c
 @@ -0,0 +1,791 @@
@@ -1140,9 +980,115 @@
 +		thread_deallocate(thread);
 +	}
 +}
+diff --git a/xnu/files/bsd/dev/hakios.input.c b/xnu/files/bsd/dev/hakios.input.c
+index 5f8aeb8..d4e6652 100644
+--- a/xnu/files/bsd/dev/hakios.input.c
++++ b/xnu/files/bsd/dev/hakios.input.c
+@@ -205,6 +205,14 @@ static const struct cdevsw touch_cdevsw = {
+ 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+ };
+ 
++bool
++hakios_board_is(const char *name)
++{
++	char board[16];
++
++	return PE_parse_boot_arg_str("hakios_board", board, sizeof(board)) && strcmp(board, name) == 0;
++}
++
+ void
+ hakios_input_init(void)
+ {
+@@ -217,6 +225,7 @@ hakios_input_init(void)
+ 	hakios_cpufreq_init();
+ 	hakios_virtio_input_init();
+ 	hakios_goodix_init();
++	hakios_ilitek_init();
+ 	hakios_buttons_init();
+ 	hakios_battery_init();
+ 	hakios_ufs_init();
+diff --git a/xnu/files/bsd/dev/hakios.mpss.c b/xnu/files/bsd/dev/hakios.mpss.c
+index 15c8115..21e38a3 100644
 --- a/xnu/files/bsd/dev/hakios.mpss.c
 +++ b/xnu/files/bsd/dev/hakios.mpss.c
-@@ -1046,7 +1046,9 @@ step_survey(void)
+@@ -945,16 +945,74 @@ rails(uint32_t level)
+  * resource, a "bus clock manager" named IP0 (Linux's clk-rpmh.c: BCM votes are a word of commit
+  * (bit 30), valid (bit 29) and a vote of 14 bits).
+  */
++static bool rpmh_send(const char *name, uint32_t address, uint32_t value);
++
+ static bool
+ rpmh_command(const char *name, uint32_t value)
+ {
+-	uint32_t address = 0, done = 0;
+-	uint64_t began;
++	uint32_t address = 0;
+ 
+ 	if (rail_position(name, 0, &address) < 0 || address == 0) {
+ 		printf("mpss: %u: RPMh has no \"%s\": nothing is asked\n", step, name);
+ 		return false;
+ 	}
++	return rpmh_send(name, address, value);
++}
++
++/* A resource's address in the command database, whatever its data (a regulator's has none); 0: not there. */
++static uint32_t
++rpmh_address(const char *name)
++{
++	char id[8] = { 0 };
++
++	if (cmd_db == NULL) {
++		cmd_db = (const struct cmd_db_header *)ml_io_map_unmappable(cmd_db_phys, CMD_DB_SIZE, VM_WIMG_WCOMB);
++	}
++	if (!(cmd_db->magic[0] == 0xdb && cmd_db->magic[1] == 0x30 && cmd_db->magic[2] == 0x03 && cmd_db->magic[3] == 0x0c)) {
++		return 0;
++	}
++	strlcpy(id, name, sizeof(id));
++	for (unsigned s = 0; s < 8; s++) {
++		const struct cmd_db_slave *slave = &cmd_db->slave[s];
++		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
++
++		if (slave->id == 0 || slave->count > 512) {
++			continue;
++		}
++		for (unsigned i = 0; i < slave->count; i++) {
++			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
++				return entry[i].address;
++			}
++		}
++	}
++	return 0;
++}
++
++/*
++ * One word to one of a regulator's registers through RPMh (Linux's rpmh-regulator.c: a VRM's voltage in
++ * mV at +0, enable at +4, mode at +8): for hakios.wcn3990.c, which powers the Wi-Fi radio. True: done.
++ */
++bool hakios_mpss_vrm(const char *name, uint32_t offset, uint32_t value);
++bool
++hakios_mpss_vrm(const char *name, uint32_t offset, uint32_t value)
++{
++	uint32_t address = rpmh_address(name);
++	char what[32];
++
++	if (address == 0) {
++		printf("mpss: RPMh has no \"%s\": nothing is asked\n", name);
++		return false;
++	}
++	snprintf(what, sizeof(what), "%s+%u", name, offset);
++	return rpmh_send(what, address + offset, value);
++}
++
++static bool
++rpmh_send(const char *name, uint32_t address, uint32_t value)
++{
++	uint32_t done = 0;
++	uint64_t began;
++
+ 	need(&rsc);
+ 	lck_mtx_lock(&hakios_rsc_lock);
+ 	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
+@@ -1046,7 +1104,9 @@ step_survey(void)
  
  #define MPSS_MEMORY_DEFAULT     0x8b800000u   /* dt: reserved-memory mpss@..., memory-region of qcom,mss */
  static uint32_t mpss_memory = MPSS_MEMORY_DEFAULT;
@@ -1153,7 +1099,22 @@
  #define PAS_MPSS_DEFAULT        4               /* dt: qcom,pas-id of qcom,mss */
  static uint32_t pas_mpss = PAS_MPSS_DEFAULT;
  
-@@ -3591,6 +3593,28 @@ rmtfs_load(void)
+@@ -1098,6 +1158,14 @@ root_file(const char *name, uint64_t *size)
+ 	return data;
+ }
+ 
++/* The same for the rest of the kernel (hakios.wcn3990.c): memory of ours, given back with kfree_data(). */
++const uint8_t *hakios_mpss_file(const char *name, uint64_t *size);
++const uint8_t *
++hakios_mpss_file(const char *name, uint64_t *size)
++{
++	return root_file(name, size);
++}
++
+ static bool from_root;                  /* the image is in memory of ours (root_file()), to be given back once written */
+ 
+ /* A file of fw/ in the small image (MODEM=1 userland/build.sh puts fw-modem/ there), else of /fw on the root (above). */
+@@ -3591,6 +3659,28 @@ rmtfs_load(void)
  		uint64_t size = 0;
  		int error = hakios_ufs_read_partition(rmtfs_files[f].partition, 0, NULL, 0, &size);
  
@@ -1182,7 +1143,77 @@
  		if (error != 0 || size == 0 || size > (64u << 20)) {
  			printf("mpss: %u: the partition %s: %s (%d)\n", step, rmtfs_files[f].partition, error == ENXIO ?
  			    "no storage to read it from (the loader was not asked for ufs=2)" : "not read", error);
-@@ -4556,7 +4580,7 @@ jsn_string(const char *from, const char *end, const char *key, char *out, size_t
+@@ -3651,6 +3741,69 @@ rmtfs_buffer_make(void)
+ 	return true;
+ }
+ 
++/*
++ * TrustZone asked to move memory from one set of owners to another, each of the new ones with read and
++ * write (Linux's qcom_scm_assign_mem()), as rmtfs_share() below moves the buffer: for hakios.wcn3990.c,
++ * which hands the Wi-Fi firmware's memory to the modem and the Wi-Fi VM. Up to three owners now, four after.
++ */
++bool hakios_mpss_assign(uint64_t address, uint64_t size, const uint32_t *from, unsigned from_count, const uint32_t *to,
++    unsigned to_count);
++bool
++hakios_mpss_assign(uint64_t address, uint64_t size, const uint32_t *from, unsigned from_count, const uint32_t *to,
++    unsigned to_count)
++{
++	struct {
++		uint64_t address, size;                 /* +0: the memory */
++		uint64_t pad0[6];
++		uint32_t sources[3];                    /* +64: who has it */
++		uint32_t pad1[13];
++		struct {                                /* +128: who is to have it */
++			uint32_t vmid, permission;
++			uint64_t context;
++			uint32_t context_size, unused;
++		} destinations[4];
++		uint8_t pad2[16];
++		uint64_t more[7];                       /* +240: the arguments beyond the registers */
++	} *page;
++	vm_offset_t memory = 0;
++	uint64_t answer = ~0ull, pa;
++	int32_t result;
++
++	if (from_count == 0 || from_count > 3 || to_count == 0 || to_count > 4) {
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &memory, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	page = (void *)memory;
++	page->address = address;
++	page->size = size;
++	for (unsigned i = 0; i < from_count; i++) {
++		page->sources[i] = from[i];
++	}
++	for (unsigned i = 0; i < to_count; i++) {
++		page->destinations[i].vmid = to[i];
++		page->destinations[i].permission = VM_PERM_RW;
++	}
++	pa = kvtophys(memory);
++	page->more[0] = from_count * 4;
++	page->more[1] = pa + 128;
++	page->more[2] = to_count * sizeof(page->destinations[0]);
++	page->more[3] = 0;
++	for (vm_offset_t line = memory; line < memory + PAGE_SIZE; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line));
++	}
++	settle();
++	result = scm("to move memory between owners", SCM_MP_ASSIGN, SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64, pa + 240, &answer);
++	kmem_free(kernel_map, memory, PAGE_SIZE);
++	if (result != 0 || answer != 0) {
++		printf("mpss: TRUSTZONE DOES NOT MOVE %#llx bytes at %#llx: the call returns %d, its answer is %#llx\n", size, address,
++		    result, answer);
++		return false;
++	}
++	return true;
++}
++
+ /*
+  * TrustZone asked to let the modem into the buffer (Linux's qcom_scm_assign_mem(): the memory, who
+  * has it now, who is to have it and how), or, with `in` false, out of it again.
+@@ -4556,7 +4709,7 @@ jsn_string(const char *from, const char *end, const char *key, char *out, size_t
  static void
  servreg_load(void)
  {
@@ -1191,7 +1222,7 @@
  
  	servreg_maps = 0;
  	for (unsigned f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
-@@ -5003,9 +5027,22 @@ step_queues(void)
+@@ -5003,9 +5156,22 @@ step_queues(void)
  {
  	struct glink_message message;
  	uint32_t head, tail;
@@ -1215,7 +1246,30 @@
  		printf("mpss: %u: GLINK's items are not all there, or not of a shape this knows (descriptor %#x, ours %#x of %u bytes, "
  		    "the DSP's %#x of %u)\n", step, glink.descriptor, glink.ours, glink.ours_size, glink.theirs, glink.theirs_size);
  		return false;
-@@ -6329,14 +6366,17 @@ soc_override(void)
+@@ -6185,6 +6351,7 @@ static bool (*const steps[STEPS])(void) = {
+ };
+ 
+ static bool keep;                       /* the DSP and the link stay up while the system runs (modem_keep, modem=1) */
++extern void hakios_wcn3990_exchange(uint32_t step);
+ 
+ static void
+ steps_over(uint32_t done)
+@@ -6248,6 +6415,14 @@ run_steps(void)
+ 		done = step;
+ 	}
+ 	step = done;
++	{
++		uint32_t wcn = 0;
++
++		/* the X01A's Wi-Fi firmware, inside the modem (hakios.wcn3990.c) */
++		if (done == last_step && done >= 10 && PE_parse_boot_argn("wcn3990", &wcn, sizeof(wcn)) && wcn != 0) {
++			hakios_wcn3990_exchange(done);
++		}
++	}
+ 	new_from = STEPS + 1;
+ 	steps_over(done);
+ 	printf("mpss: over after step %u; %s\n", done, last_write);
+@@ -6329,14 +6504,17 @@ soc_override(void)
  	PE_parse_boot_argn("soc_smem", &smem_phys, sizeof(smem_phys));
  	PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
  	PE_parse_boot_argn("soc_mpss_mem", &mpss_memory, sizeof(mpss_memory));
@@ -1235,3 +1289,932 @@
  	}
  }
  
+diff --git a/xnu/files/bsd/dev/hakios.wcn3990.c b/xnu/files/bsd/dev/hakios.wcn3990.c
+new file mode 100644
+index 0000000..c6090f5
+--- /dev/null
++++ b/xnu/files/bsd/dev/hakios.wcn3990.c
+@@ -0,0 +1,775 @@
++/*
++ * The Wi-Fi firmware of the BALMUDA Phone (X01A), spoken to. The radio is a WCN3990; its firmware
++ * runs inside the modem (msm/modem/wlan_pd, which loads wlanmdsp.mbn), and once it is up it offers
++ * the service WLFW (QRTR service 69) on the modem's node. Before Linux's ath10k touches the radio
++ * it has an exchange with that service, and this file makes the first part of it by hand, in
++ * ath10k's order (ath10k_hw_power_on(), then ath10k_qmi_event_server_arrive() and what it calls):
++ *
++ *   0  the radio's five supplies on, through RPMh (power_on() below; wcn3990_power=0: not)
++ *   1  which indications we want: "firmware ready", "MSA ready", the pins' result
++ *   2  where the firmware's memory is (the fixed region, dt: qcom,wlan-msa-fixed-region of
++ *      qcom,icnss: pil_wlan_fw_region@8ba00000, 2 MB); the firmware answers with the regions it
++ *      makes of it, and TrustZone is asked to give each to the modem and the Wi-Fi VM. On this
++ *      phone TrustZone refuses every such move (-2, 0x56) and the firmware takes "MSA ready" all the
++ *      same, so a refusal is said and passed over
++ *   3  "MSA ready"
++ *   4  what the chip and the firmware are (chip, board id, firmware version)
++ *   5  the board's data file, bdwlan.bXX for that board id (fw/image of the system image), in pieces
++ *   6  a wait for "firmware ready"
++ *
++ * It stops there: no mode is asked for. It runs after the modem's step 10 (hakios.mpss.c) with
++ * boot-arg wcn3990=1, while the modem's link is up, and the modem is shut down after it as after any
++ * run of the steps. The phone is to be rebooted before the modem is started again.
++ *
++ * What the phone said (29 October): chip 0x320 of family 0x4001, no board id (bdwlan.bin is sent),
++ * firmware WLAN.HL.3.3.1-01557 of 13 October 2022; the board file is taken in 5 pieces; without the
++ * supplies no "firmware ready" in 10 s.
++ *
++ * The messages' descriptions below are written from the WLFW messages' published shape (QMI
++ * service 0x45, version 1); only the fields used here are described, and the decoder skips the rest.
++ *
++ * More boot-args: wcn3990_msa=0x..., wcn3990_msa_size=0x... (the region), wcn3990_ready=S (the wait
++ * of 6, default 15; Android waits 5.5 s), wcn3990_upto=N (1 to N only: a run that ends the phone loses its log, and this
++ * finds the step).
++ */
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/systm.h>
++#include <sys/hakios.qmi.h>
++#include <sys/hakios.qrtr.h>
++
++extern const struct hakios_qrtr_ops *hakios_mpss_qrtr(void);
++extern const uint8_t *hakios_mpss_file(const char *name, uint64_t *size);
++extern bool hakios_mpss_assign(uint64_t address, uint64_t size, const uint32_t *from, unsigned from_count, const uint32_t *to,
++    unsigned to_count);
++extern bool hakios_mpss_vrm(const char *name, uint32_t offset, uint32_t value);
++void hakios_wcn3990_exchange(uint32_t step);
++
++#define WLFW_SERVICE            0x45
++#define WLFW_VERSION            1
++#define WLFW_INSTANCE           0
++#define WLFW_CLIENT_ID          0x4b4e454c      /* "LENK", as ath10k says who it is */
++#define WLFW_TIMEOUT_MS         5000
++#define WLFW_LARGEST            8192
++
++#define WLFW_IND_REGISTER       0x0020
++#define WLFW_FW_READY_IND       0x0021
++#define WLFW_CAP                0x0024
++#define WLFW_BDF_DOWNLOAD       0x0025
++#define WLFW_MSA_READY_IND      0x002b
++#define WLFW_PIN_CONNECT_IND    0x002c
++#define WLFW_MSA_INFO           0x002d
++#define WLFW_MSA_READY          0x002e
++
++#define WLFW_MAX_REGIONS        2
++#define WLFW_MAX_DATA           6144
++#define WLFW_TIMESTAMP_LEN      32
++#define WLFW_BUILD_ID_LEN       128
++
++#define VMID_HLOS               3
++#define VMID_MSS_MSA            15
++#define VMID_WLAN               0x18
++#define VMID_WLAN_CE            0x19
++
++#define MSA_DEFAULT             0x8ba00000ull   /* dt: pil_wlan_fw_region@8ba00000 */
++#define MSA_SIZE_DEFAULT        0x200000u
++
++/* ---- the messages ----------------------------------------------------------------------------------- */
++
++#define EI_END                  { .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE }
++#define EI_RESULT(s)            { QMI_STRUCT, 1, sizeof(struct qmi_response_type_v01), NO_ARRAY, 0x02, \
++	                          __offsetof(s, resp), qmi_response_type_v01_ei }
++#define EI_OPT(s, f, t)         { QMI_OPT_FLAG, 1, sizeof(uint8_t), NO_ARRAY, t, __offsetof(s, f##_valid), NULL }
++#define EI_U8(s, f, t)          { QMI_UNSIGNED_1_BYTE, 1, sizeof(uint8_t), NO_ARRAY, t, __offsetof(s, f), NULL }
++#define EI_U32(s, f, t)         { QMI_UNSIGNED_4_BYTE, 1, sizeof(uint32_t), NO_ARRAY, t, __offsetof(s, f), NULL }
++#define EI_U64(s, f, t)         { QMI_UNSIGNED_8_BYTE, 1, sizeof(uint64_t), NO_ARRAY, t, __offsetof(s, f), NULL }
++
++struct ind_register_req {
++	uint8_t fw_ready_enable_valid, fw_ready_enable;
++	uint8_t msa_ready_enable_valid, msa_ready_enable;
++	uint8_t pin_connect_result_enable_valid, pin_connect_result_enable;
++	uint8_t client_id_valid;
++	uint32_t client_id;
++};
++static const struct qmi_elem_info ind_register_req_ei[] = {
++	EI_OPT(struct ind_register_req, fw_ready_enable, 0x10), EI_U8(struct ind_register_req, fw_ready_enable, 0x10),
++	EI_OPT(struct ind_register_req, msa_ready_enable, 0x13), EI_U8(struct ind_register_req, msa_ready_enable, 0x13),
++	EI_OPT(struct ind_register_req, pin_connect_result_enable, 0x14),
++	EI_U8(struct ind_register_req, pin_connect_result_enable, 0x14),
++	EI_OPT(struct ind_register_req, client_id, 0x15), EI_U32(struct ind_register_req, client_id, 0x15),
++	EI_END,
++};
++
++struct ind_register_resp {
++	struct qmi_response_type_v01 resp;
++	uint8_t fw_status_valid;
++	uint64_t fw_status;
++};
++static const struct qmi_elem_info ind_register_resp_ei[] = {
++	EI_RESULT(struct ind_register_resp),
++	EI_OPT(struct ind_register_resp, fw_status, 0x10), EI_U64(struct ind_register_resp, fw_status, 0x10),
++	EI_END,
++};
++
++struct msa_info_req {
++	uint64_t msa_addr;
++	uint32_t size;
++};
++static const struct qmi_elem_info msa_info_req_ei[] = {
++	EI_U64(struct msa_info_req, msa_addr, 0x01), EI_U32(struct msa_info_req, size, 0x02),
++	EI_END,
++};
++
++struct msa_region {
++	uint64_t region_addr;
++	uint32_t size;
++	uint8_t secure_flag;
++};
++static const struct qmi_elem_info msa_region_ei[] = {
++	EI_U64(struct msa_region, region_addr, 0), EI_U32(struct msa_region, size, 0), EI_U8(struct msa_region, secure_flag, 0),
++	EI_END,
++};
++
++struct msa_info_resp {
++	struct qmi_response_type_v01 resp;
++	uint32_t regions_len;
++	struct msa_region regions[WLFW_MAX_REGIONS];
++};
++static const struct qmi_elem_info msa_info_resp_ei[] = {
++	EI_RESULT(struct msa_info_resp),
++	{ QMI_DATA_LEN, 1, sizeof(uint8_t), NO_ARRAY, 0x03, __offsetof(struct msa_info_resp, regions_len), NULL },
++	{ QMI_STRUCT, WLFW_MAX_REGIONS, sizeof(struct msa_region), VAR_LEN_ARRAY, 0x03, __offsetof(struct msa_info_resp, regions),
++	  msa_region_ei },
++	EI_END,
++};
++
++/* "MSA ready" and "what are you": requests with nothing in them */
++struct empty_req {
++	uint8_t unused;
++};
++static const struct qmi_elem_info empty_req_ei[] = { EI_END };
++
++struct result_resp {
++	struct qmi_response_type_v01 resp;
++};
++static const struct qmi_elem_info result_resp_ei[] = { EI_RESULT(struct result_resp), EI_END };
++
++struct cap_chip {
++	uint32_t chip_id, chip_family;
++};
++static const struct qmi_elem_info cap_chip_ei[] = {
++	EI_U32(struct cap_chip, chip_id, 0), EI_U32(struct cap_chip, chip_family, 0), EI_END,
++};
++struct cap_one {
++	uint32_t value;
++};
++static const struct qmi_elem_info cap_one_ei[] = { EI_U32(struct cap_one, value, 0), EI_END };
++struct cap_version {
++	uint32_t fw_version;
++	char fw_build_timestamp[WLFW_TIMESTAMP_LEN + 1];
++};
++static const struct qmi_elem_info cap_version_ei[] = {
++	EI_U32(struct cap_version, fw_version, 0),
++	{ QMI_STRING, WLFW_TIMESTAMP_LEN + 1, sizeof(char), NO_ARRAY, 0, __offsetof(struct cap_version, fw_build_timestamp), NULL },
++	EI_END,
++};
++
++struct cap_resp {
++	struct qmi_response_type_v01 resp;
++	uint8_t chip_info_valid;
++	struct cap_chip chip_info;
++	uint8_t board_info_valid;
++	struct cap_one board_info;
++	uint8_t soc_info_valid;
++	struct cap_one soc_info;
++	uint8_t fw_version_info_valid;
++	struct cap_version fw_version_info;
++	uint8_t fw_build_id_valid;
++	char fw_build_id[WLFW_BUILD_ID_LEN + 1];
++};
++static const struct qmi_elem_info cap_resp_ei[] = {
++	EI_RESULT(struct cap_resp),
++	EI_OPT(struct cap_resp, chip_info, 0x10),
++	{ QMI_STRUCT, 1, sizeof(struct cap_chip), NO_ARRAY, 0x10, __offsetof(struct cap_resp, chip_info), cap_chip_ei },
++	EI_OPT(struct cap_resp, board_info, 0x11),
++	{ QMI_STRUCT, 1, sizeof(struct cap_one), NO_ARRAY, 0x11, __offsetof(struct cap_resp, board_info), cap_one_ei },
++	EI_OPT(struct cap_resp, soc_info, 0x12),
++	{ QMI_STRUCT, 1, sizeof(struct cap_one), NO_ARRAY, 0x12, __offsetof(struct cap_resp, soc_info), cap_one_ei },
++	EI_OPT(struct cap_resp, fw_version_info, 0x13),
++	{ QMI_STRUCT, 1, sizeof(struct cap_version), NO_ARRAY, 0x13, __offsetof(struct cap_resp, fw_version_info),
++	  cap_version_ei },
++	EI_OPT(struct cap_resp, fw_build_id, 0x14),
++	{ QMI_STRING, WLFW_BUILD_ID_LEN + 1, sizeof(char), NO_ARRAY, 0x14, __offsetof(struct cap_resp, fw_build_id), NULL },
++	EI_END,
++};
++
++struct bdf_req {
++	uint8_t valid;
++	uint8_t file_id_valid;
++	uint32_t file_id;
++	uint8_t total_size_valid;
++	uint32_t total_size;
++	uint8_t seg_id_valid;
++	uint32_t seg_id;
++	uint8_t data_valid;
++	uint32_t data_len;
++	uint8_t data[WLFW_MAX_DATA];
++	uint8_t end_valid;
++	uint8_t end;
++};
++static const struct qmi_elem_info bdf_req_ei[] = {
++	EI_U8(struct bdf_req, valid, 0x01),
++	EI_OPT(struct bdf_req, file_id, 0x10), EI_U32(struct bdf_req, file_id, 0x10),
++	EI_OPT(struct bdf_req, total_size, 0x11), EI_U32(struct bdf_req, total_size, 0x11),
++	EI_OPT(struct bdf_req, seg_id, 0x12), EI_U32(struct bdf_req, seg_id, 0x12),
++	EI_OPT(struct bdf_req, data, 0x13),
++	{ QMI_DATA_LEN, 1, sizeof(uint16_t), NO_ARRAY, 0x13, __offsetof(struct bdf_req, data_len), NULL },
++	{ QMI_UNSIGNED_1_BYTE, WLFW_MAX_DATA, sizeof(uint8_t), VAR_LEN_ARRAY, 0x13, __offsetof(struct bdf_req, data), NULL },
++	EI_OPT(struct bdf_req, end, 0x14), EI_U8(struct bdf_req, end, 0x14),
++	EI_END,
++};
++
++/* "these are the calibration files I have": none, as ath10k says it when it has none */
++#define WLFW_CAL_REPORT         0x0026
++#define WLFW_MAX_CAL_FILES      4
++struct cal_report_req {
++	uint32_t meta_data_len;
++	uint32_t meta_data[WLFW_MAX_CAL_FILES];
++};
++static const struct qmi_elem_info cal_report_req_ei[] = {
++	{ QMI_DATA_LEN, 1, sizeof(uint8_t), NO_ARRAY, 0x01, __offsetof(struct cal_report_req, meta_data_len), NULL },
++	{ QMI_UNSIGNED_4_BYTE, WLFW_MAX_CAL_FILES, sizeof(uint32_t), VAR_LEN_ARRAY, 0x01, __offsetof(struct cal_report_req, meta_data),
++	  NULL },
++	EI_END,
++};
++
++struct pin_result_ind {
++	uint8_t pwr_pin_result_valid;
++	uint32_t pwr_pin_result;
++	uint8_t phy_io_pin_result_valid;
++	uint32_t phy_io_pin_result;
++	uint8_t rf_pin_result_valid;
++	uint32_t rf_pin_result;
++};
++static const struct qmi_elem_info pin_result_ind_ei[] = {
++	EI_OPT(struct pin_result_ind, pwr_pin_result, 0x10), EI_U32(struct pin_result_ind, pwr_pin_result, 0x10),
++	EI_OPT(struct pin_result_ind, phy_io_pin_result, 0x11), EI_U32(struct pin_result_ind, phy_io_pin_result, 0x11),
++	EI_OPT(struct pin_result_ind, rf_pin_result, 0x12), EI_U32(struct pin_result_ind, rf_pin_result, 0x12),
++	EI_END,
++};
++
++/* ---- the handle, and what the firmware says by itself ------------------------------------------------- */
++
++static struct qmi_handle handle;
++static struct {
++	volatile bool server, gone, fw_ready, msa_ready, pins;
++	uint64_t began;
++	uint32_t step;
++} wcn;
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t nanoseconds;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &nanoseconds);
++	return nanoseconds / 1000000;
++}
++
++static int
++wcn_new_server(struct qmi_handle *qmi, struct qmi_service *service)
++{
++	int error = hakios_qmi_connect(qmi->sock, service->node, service->port);
++
++	printf("wcn3990: %u: the service is at node %u port %u (service %#x, version %u, instance %u)%s\n", wcn.step,
++	    service->node, service->port, service->service, service->version, service->instance,
++	    error ? ": CANNOT BE CONNECTED TO" : "");
++	wcn.server = error == 0;
++	return error;
++}
++
++static void
++wcn_del_server(__unused struct qmi_handle *qmi, struct qmi_service *service)
++{
++	printf("wcn3990: %u: THE SERVICE AT NODE %u PORT %u HAS GONE\n", wcn.step, service->node, service->port);
++	wcn.gone = true;
++}
++
++static void
++wcn_fw_ready(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, __unused struct qmi_txn *txn,
++    __unused const void *decoded)
++{
++	wcn.fw_ready = true;
++	printf("wcn3990: %u: +%llu ms: THE FIRMWARE SAYS \"firmware ready\"\n", wcn.step, now_ms() - wcn.began);
++}
++
++static void
++wcn_msa_ready(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, __unused struct qmi_txn *txn,
++    __unused const void *decoded)
++{
++	wcn.msa_ready = true;
++	printf("wcn3990: %u: +%llu ms: the firmware says \"MSA ready\"\n", wcn.step, now_ms() - wcn.began);
++}
++
++static void
++wcn_pins(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, __unused struct qmi_txn *txn, const void *decoded)
++{
++	const struct pin_result_ind *pins = decoded;
++
++	wcn.pins = true;
++	printf("wcn3990: %u: +%llu ms: the pins' result: power %#x%s, PHY I/O %#x%s, RF %#x%s\n", wcn.step, now_ms() - wcn.began,
++	    pins->pwr_pin_result, pins->pwr_pin_result_valid ? "" : " (not said)", pins->phy_io_pin_result,
++	    pins->phy_io_pin_result_valid ? "" : " (not said)", pins->rf_pin_result, pins->rf_pin_result_valid ? "" : " (not said)");
++}
++
++static const struct qmi_ops wcn_ops = { .new_server = wcn_new_server, .del_server = wcn_del_server };
++static const struct qmi_msg_handler wcn_handlers[] = {
++	{ QMI_INDICATION, WLFW_FW_READY_IND, empty_req_ei, sizeof(struct empty_req), wcn_fw_ready },
++	{ QMI_INDICATION, WLFW_MSA_READY_IND, empty_req_ei, sizeof(struct empty_req), wcn_msa_ready },
++	{ QMI_INDICATION, WLFW_PIN_CONNECT_IND, pin_result_ind_ei, sizeof(struct pin_result_ind), wcn_pins },
++	{ 0 },
++};
++
++/*
++ * How far the exchange has got, painted on the screen (boot-arg wcn3990_marks=1): one band of colour per
++ * point passed, repainted every few milliseconds over whatever the system draws. A run that ends the
++ * phone loses its log, and the panel keeps the last frame: a photograph of it says where the end was.
++ * The framebuffer is the loader's (0xa0000000, 1080 x 1920, 4 bytes a pixel, as on this phone); only the strip
++ * of it the bands are in is mapped.
++ */
++#define FB_PHYS                 0xa0000000ul
++#define FB_WIDTH                1080
++#define FB_HEIGHT               1920
++#define MARK_TOP                300
++#define MARK_HEIGHT             30
++#define MARK_GAP                10
++#define MARKS                   10
++
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++
++static volatile uint32_t *fb;
++static volatile uint32_t marks;
++static volatile bool marking;
++
++/* BGRx: white, red, green, blue, yellow, cyan, magenta, orange, grey, white */
++static const uint32_t mark_colour[] = { 0xffffff, 0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0x00ffff, 0xff00ff, 0xff8000, 0x808080,
++	                                    0xffffff };
++
++static void
++mark_paint(void)
++{
++	for (uint32_t m = 0; m < marks && m < sizeof(mark_colour) / sizeof(mark_colour[0]); m++) {
++		for (uint32_t y = m * (MARK_HEIGHT + MARK_GAP); y < m * (MARK_HEIGHT + MARK_GAP) + MARK_HEIGHT; y++) {
++			for (uint32_t x = 0; x < FB_WIDTH; x++) {
++				fb[y * FB_WIDTH + x] = mark_colour[m];
++			}
++		}
++	}
++}
++
++static void
++mark_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	while (marking) {
++		mark_paint();
++		delay_for_interval(20, NSEC_PER_MSEC);
++	}
++	thread_terminate(current_thread());
++}
++
++static void
++mark(void)
++{
++	if (fb != NULL) {
++		marks++;
++		mark_paint();
++		printf("wcn3990: %u: mark %u painted\n", wcn.step, marks);
++	}
++}
++
++static void
++marks_start(void)
++{
++	thread_t thread;
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("wcn3990_marks", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	/* only the strip the bands are in: the whole framebuffer (8 MB) is more than the kernel's map has to spare */
++	fb = (volatile uint32_t *)ml_io_map_wcomb(FB_PHYS + (vm_offset_t)MARK_TOP * FB_WIDTH * 4,
++	    (vm_size_t)FB_WIDTH * 4 * MARKS * (MARK_HEIGHT + MARK_GAP));
++	if (fb == NULL) {
++		return;
++	}
++	marks = 0;
++	marking = true;
++	if (kernel_thread_start(mark_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++static bool
++wait_for(volatile bool *flag, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms && !*flag && !wcn.gone; i++) {
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	return *flag;
++}
++
++/* One request and its reply; `reply` begins with the result. True: the firmware said "success". */
++static bool
++ask(const char *what, int message, const struct qmi_elem_info *request_ei, const void *request,
++    const struct qmi_elem_info *reply_ei, void *reply, bool quiet)
++{
++	const struct qmi_response_type_v01 *result = reply;
++	struct qmi_txn txn;
++	uint64_t began = now_ms();
++	int ret = qmi_txn_init(&handle, &txn, reply_ei, reply);
++
++	if (ret >= 0) {
++		ret = qmi_send_request(&handle, NULL, &txn, message, WLFW_LARGEST, request_ei, request);
++		if (ret < 0) {
++			qmi_txn_cancel(&txn);
++		} else {
++			ret = hakios_qmi_txn_wait_ms(&txn, WLFW_TIMEOUT_MS);
++		}
++	}
++	if (ret >= 0 && result->result == QMI_RESULT_SUCCESS_V01) {
++		if (!quiet) {
++			printf("wcn3990: %u: %s (message %#x): success, after %llu ms\n", wcn.step, what, message, now_ms() - began);
++		}
++		return true;
++	}
++	if (ret < 0) {
++		printf("wcn3990: %u: %s (message %#x): NO ANSWER THAT CAN BE READ: %d, after %llu ms\n", wcn.step, what, message, ret,
++		    now_ms() - began);
++	} else {
++		printf("wcn3990: %u: %s (message %#x): THE FIRMWARE REFUSES: result %u, error %u, after %llu ms\n", wcn.step, what,
++		    message, result->result, result->error, now_ms() - began);
++	}
++	return false;
++}
++
++/* The board's data file for that board id, as Android's driver names it; the generic one if there is no such file. */
++static bool
++send_board(uint32_t board_id, bool board_id_known)
++{
++	static struct bdf_req request;
++	struct result_resp reply;
++	char name[32];
++	uint64_t size = 0, began = now_ms();
++	uint8_t *data = NULL;                   /* hakios_mpss_file()'s memory, given back below */
++	const uint8_t *at;
++	uint32_t left, pieces = 0;
++
++	if (board_id_known && board_id != 0xff) {
++		snprintf(name, sizeof(name), board_id < 0x100 ? "image/bdwlan.b%02x" : "image/bdwlan.%03x", board_id);
++		data = __DECONST(uint8_t *, hakios_mpss_file(name, &size));
++		if (data == NULL) {
++			printf("wcn3990: %u: no fw/%s: the generic board file instead\n", wcn.step, name);
++		}
++	}
++	if (data == NULL) {
++		strlcpy(name, "image/bdwlan.bin", sizeof(name));
++		data = __DECONST(uint8_t *, hakios_mpss_file(name, &size));
++	}
++	if (data == NULL || size == 0 || size > 1024 * 1024) {
++		printf("wcn3990: %u: no board file (fw/%s, %llu bytes): nothing sent\n", wcn.step, name, size);
++		if (data != NULL) {
++			kfree_data(data, size);
++		}
++		return false;
++	}
++	printf("wcn3990: %u: the board file: fw/%s, %llu bytes, beginning %02x %02x %02x %02x\n", wcn.step, name, size, data[0],
++	    data[1], data[2], data[3]);
++	bzero(&request, sizeof(request));
++	for (at = data, left = (uint32_t)size; left > 0; pieces++) {
++		request.valid = 1;
++		request.file_id_valid = 1;
++		request.file_id = 0;
++		request.total_size_valid = 1;
++		request.total_size = (uint32_t)size;
++		request.seg_id_valid = 1;
++		request.data_valid = 1;
++		request.end_valid = 1;
++		request.end = left <= WLFW_MAX_DATA;
++		request.data_len = request.end ? left : WLFW_MAX_DATA;
++		memcpy(request.data, at, request.data_len);
++		bzero(&reply, sizeof(reply));
++		if (!ask("a piece of the board file", WLFW_BDF_DOWNLOAD, bdf_req_ei, &request, result_resp_ei, &reply, true)) {
++			printf("wcn3990: %u: the board file: REFUSED AT PIECE %u (%u bytes still to go)\n", wcn.step, pieces, left);
++			kfree_data(data, size);
++			return false;
++		}
++		left -= request.data_len;
++		at += request.data_len;
++		request.seg_id++;
++	}
++	kfree_data(data, size);
++	printf("wcn3990: %u: THE BOARD FILE IS TAKEN: %u pieces in %llu ms\n", wcn.step, pieces, now_ms() - began);
++	return true;
++}
++
++/*
++ * The radio's supplies on, as ath10k's ath10k_snoc_vreg_on() turns them on before it speaks to the
++ * firmware: in its order, at the voltages of the phone's device tree (qcom,icnss: vdd-cx-mx, vdd-1.8-xo,
++ * vdd-1.3-rfa, vdd-3.3-ch0, vdd-3.3-ch1, and the bt_wcn3990 node's levels for the same rails), each in
++ * high-power mode, through RPMh. They are left on when the run ends: RPMh adds our vote to the others'
++ * (the boot loader's among them), and the next boot starts afresh.
++ */
++#define VRM_VOLTAGE             0
++#define VRM_ENABLE              4
++#define VRM_MODE                8
++#define VRM_MODE_HPM            7               /* Linux: RPMH_REGULATOR_MODE_HPM of a PMIC4/5 LDO */
++
++static bool
++power_on(uint32_t step)
++{
++	static const struct {
++		const char *supply, *resource;
++		uint32_t millivolts;            /* 0: as it is */
++	} rails[] = {
++		{ "vdd-cx-mx", "ldoa1", 0 },            /* pm8150 l1 */
++		{ "vdd-1.8-xo", "ldoa14", 1800 },       /* pm8150 l14 */
++		{ "vdd-1.3-rfa", "ldoc2", 1304 },       /* pm8150a l2 */
++		{ "vdd-3.3-ch0", "ldoc10", 3000 },      /* pm8150a l10 */
++		{ "vdd-3.3-ch1", "ldoc11", 3000 },      /* pm8150a l11 */
++	};
++
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		bool ok = (rails[i].millivolts == 0 || hakios_mpss_vrm(rails[i].resource, VRM_VOLTAGE, rails[i].millivolts)) &&
++		    hakios_mpss_vrm(rails[i].resource, VRM_MODE, VRM_MODE_HPM) && hakios_mpss_vrm(rails[i].resource, VRM_ENABLE, 1);
++
++		printf("wcn3990: %u: the radio's %s (%s)%s%s: %s\n", step, rails[i].supply, rails[i].resource,
++		    rails[i].millivolts ? ", at " : "", rails[i].millivolts ? (rails[i].millivolts == 1800 ? "1.8 V" :
++		    rails[i].millivolts == 1304 ? "1.304 V" : "3.0 V") : "", ok ? "ON" : "NOT ON (RPMh did not say done)");
++		if (!ok) {
++			return false;
++		}
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	return true;
++}
++
++/* ---- the exchange ------------------------------------------------------------------------------------- */
++
++void
++hakios_wcn3990_exchange(uint32_t step)
++{
++	const struct hakios_qrtr_ops *transport = hakios_mpss_qrtr();
++	struct ind_register_req indications = { 0 };
++	struct ind_register_resp indications_reply = { 0 };
++	struct msa_info_req msa = { 0 };
++	static struct msa_info_resp regions;
++	struct empty_req nothing = { 0 };
++	struct result_resp ready_reply = { 0 };
++	static struct cap_resp target;
++	uint64_t msa_address = MSA_DEFAULT;
++	uint32_t msa_size = MSA_SIZE_DEFAULT, seconds = 15, upto = 6, power = 1;
++	int ret;
++
++	bzero(&wcn, sizeof(wcn));
++	wcn.step = step;
++	wcn.began = now_ms();
++	PE_parse_boot_argn("wcn3990_msa", &msa_address, sizeof(msa_address));
++	PE_parse_boot_argn("wcn3990_msa_size", &msa_size, sizeof(msa_size));
++	PE_parse_boot_argn("wcn3990_ready", &seconds, sizeof(seconds));
++	PE_parse_boot_argn("wcn3990_upto", &upto, sizeof(upto));
++	PE_parse_boot_argn("wcn3990_power", &power, sizeof(power));
++	marks_start();
++	mark();                                 /* 1, white: the exchange has begun */
++	if (transport == NULL) {
++		printf("wcn3990: %u: the modem's link is not up: nothing to talk to\n", step);
++		return;
++	}
++	/* 0: ath10k_hw_power_on(), before anything is said to the firmware */
++	if (power != 0 && !power_on(step)) {
++		printf("wcn3990: %u: THE RADIO IS NOT POWERED: nothing is said to the firmware\n", step);
++		return;
++	}
++	ret = hakios_qmi_handle_init_transport(&handle, WLFW_LARGEST, &wcn_ops, wcn_handlers, transport);
++	if (ret < 0) {
++		printf("wcn3990: %u: no handle on the modem's router: %d\n", step, ret);
++		return;
++	}
++	ret = qmi_add_lookup(&handle, WLFW_SERVICE, WLFW_VERSION, WLFW_INSTANCE);
++	if (ret < 0 || !wait_for(&wcn.server, 5000)) {
++		printf("wcn3990: %u: THE SERVICE (%#x, version %u, instance %u) IS NOT THERE within 5 s (lookup: %d)\n", step,
++		    WLFW_SERVICE, WLFW_VERSION, WLFW_INSTANCE, ret);
++		goto out;
++	}
++	mark();                                 /* 2, red: the service is there */
++
++	/* 1: ath10k_qmi_ind_register_send() */
++	indications.fw_ready_enable_valid = indications.fw_ready_enable = 1;
++	indications.msa_ready_enable_valid = indications.msa_ready_enable = 1;
++	indications.pin_connect_result_enable_valid = indications.pin_connect_result_enable = 1;
++	indications.client_id_valid = 1;
++	indications.client_id = WLFW_CLIENT_ID;
++	if (!ask("which indications we want", WLFW_IND_REGISTER, ind_register_req_ei, &indications, ind_register_resp_ei,
++	    &indications_reply, false)) {
++		goto out;
++	}
++	if (indications_reply.fw_status_valid) {
++		printf("wcn3990: %u:   the firmware's status word: %#llx%s\n", step, (unsigned long long)indications_reply.fw_status,
++		    (indications_reply.fw_status & 1) ? " (it says it is ready already)" : "");
++		wcn.fw_ready = wcn.fw_ready || (indications_reply.fw_status & 1);
++	}
++	mark();                                 /* 3, green: indications registered */
++
++	if (upto < 2) {
++		goto out;
++	}
++
++	/* 2: ath10k_qmi_msa_mem_info_send_sync_msg(), then ath10k_qmi_setup_msa_permissions() */
++	msa.msa_addr = msa_address;
++	msa.size = msa_size;
++	bzero(&regions, sizeof(regions));
++	if (!ask("where the firmware's memory is", WLFW_MSA_INFO, msa_info_req_ei, &msa, msa_info_resp_ei, &regions, false)) {
++		goto out;
++	}
++	mark();                                 /* 4, blue: the firmware has said what it makes of the memory */
++	printf("wcn3990: %u:   %#x bytes at %#llx, made by the firmware into %u regions\n", step, msa_size,
++	    (unsigned long long)msa_address, regions.regions_len);
++	for (uint32_t i = 0; i < regions.regions_len && i < WLFW_MAX_REGIONS; i++) {
++		const struct msa_region *r = &regions.regions[i];
++		static const uint32_t from[] = { VMID_HLOS };
++		/*
++		 * Who is to have it: ath10k's owners first (the modem and the Wi-Fi VM, and for a region that is
++		 * not secure the Wi-Fi's copy engines too), then fewer, since this phone's TrustZone has refused
++		 * every move to a VM other than HLOS and the modem (-2, answer 0x56): the first it takes is kept.
++		 */
++		static const struct {
++			const char *name;
++			uint32_t vmids[4];
++			unsigned count;
++		} owners[2][4] = {
++			{       /* not secure */
++				{ "the modem, the Wi-Fi VM and its copy engines", { VMID_MSS_MSA, VMID_WLAN, VMID_WLAN_CE }, 3 },
++				{ "HLOS, the modem, the Wi-Fi VM and its copy engines", { VMID_HLOS, VMID_MSS_MSA, VMID_WLAN, VMID_WLAN_CE }, 4 },
++				{ "the modem alone", { VMID_MSS_MSA }, 1 },
++				{ "HLOS and the modem", { VMID_HLOS, VMID_MSS_MSA }, 2 },
++			}, {    /* secure */
++				{ "the modem and the Wi-Fi VM", { VMID_MSS_MSA, VMID_WLAN }, 2 },
++				{ "HLOS, the modem and the Wi-Fi VM", { VMID_HLOS, VMID_MSS_MSA, VMID_WLAN }, 3 },
++				{ "the modem alone", { VMID_MSS_MSA }, 1 },
++				{ "HLOS and the modem", { VMID_HLOS, VMID_MSS_MSA }, 2 },
++			},
++		};
++		unsigned taken = 4;
++
++		printf("wcn3990: %u:   region %u: %#x bytes at %#llx, %s\n", step, i, r->size, (unsigned long long)r->region_addr,
++		    r->secure_flag ? "secure" : "not secure");
++		if (r->region_addr < msa_address || r->region_addr + r->size > msa_address + msa_size) {
++			printf("wcn3990: %u:   REGION %u IS OUTSIDE THE MEMORY GIVEN: not handed over, and the exchange ends\n", step, i);
++			goto out;
++		}
++		mark();                         /* 5 (7), yellow (magenta): about to hand region 0 (1) over */
++		for (unsigned o = 0; o < 4 && taken == 4; o++) {
++			const typeof(owners[0][0]) *set = &owners[r->secure_flag ? 1 : 0][o];
++
++			if (hakios_mpss_assign(r->region_addr, r->size, from, 1, set->vmids, set->count)) {
++				taken = o;
++				printf("wcn3990: %u:   region %u handed to %s\n", step, i, set->name);
++			} else {
++				printf("wcn3990: %u:   region %u: TrustZone does not hand it to %s\n", step, i, set->name);
++			}
++		}
++		if (taken == 4) {
++			/*
++			 * HLOS may not have it: the same refusal for the CDSP's region suggests the reserved memory of the
++			 * PIL is not HLOS's here. Asked as from the modem instead, then (wcn3990_keep_going=1, the default)
++			 * not moved at all, in case the firmware can reach it already.
++			 */
++			static const uint32_t from_modem[] = { VMID_MSS_MSA };
++			const typeof(owners[0][0]) *set = &owners[r->secure_flag ? 1 : 0][0];
++			uint32_t keep_going = 1;
++
++			if (hakios_mpss_assign(r->region_addr, r->size, from_modem, 1, set->vmids, set->count)) {
++				printf("wcn3990: %u:   region %u: THE MODEM HAD IT, and TrustZone hands it on to %s\n", step, i, set->name);
++			} else {
++				PE_parse_boot_argn("wcn3990_keep_going", &keep_going, sizeof(keep_going));
++				printf("wcn3990: %u:   TRUSTZONE DOES NOT HAND REGION %u OVER, from HLOS or from the modem: %s\n", step, i,
++				    keep_going ? "left as it is, and the exchange goes on" : "the exchange ends");
++				if (!keep_going) {
++					goto out;
++				}
++			}
++		}
++		mark();                         /* 6 (8), cyan (orange): handed over */
++	}
++
++	if (upto < 3) {
++		goto out;
++	}
++
++	/* 3: ath10k_qmi_msa_ready_send_sync_msg() */
++	if (!ask("the memory is ready", WLFW_MSA_READY, empty_req_ei, &nothing, result_resp_ei, &ready_reply, false)) {
++		goto out;
++	}
++	mark();
++
++	if (upto < 4) {
++		goto out;
++	}
++
++	/* 4: ath10k_qmi_cap_send_sync_msg() */
++	bzero(&target, sizeof(target));
++	if (!ask("what the chip and the firmware are", WLFW_CAP, empty_req_ei, &nothing, cap_resp_ei, &target, false)) {
++		goto out;
++	}
++	mark();
++	printf("wcn3990: %u:   chip %#x of family %#x%s; board id %#x%s; SoC %#x%s\n", step, target.chip_info.chip_id,
++	    target.chip_info.chip_family, target.chip_info_valid ? "" : " (not said)", target.board_info.value,
++	    target.board_info_valid ? "" : " (not said)", target.soc_info.value, target.soc_info_valid ? "" : " (not said)");
++	if (target.fw_version_info_valid) {
++		printf("wcn3990: %u:   firmware version %#x, built %s\n", step, target.fw_version_info.fw_version,
++		    target.fw_version_info.fw_build_timestamp);
++	}
++	if (target.fw_build_id_valid) {
++		printf("wcn3990: %u:   firmware build %s\n", step, target.fw_build_id);
++	}
++	if (upto < 5) {
++		goto out;
++	}
++
++	/* 5: ath10k_qmi_load_board_data(), the board file only (no calibration file) */
++	if (!send_board(target.board_info.value, target.board_info_valid)) {
++		goto out;
++	}
++
++	/* ... and ath10k_qmi_send_cal_report_req(), which Android's cnss-daemon sends next as well ("check for xo cal file") */
++	{
++		struct cal_report_req report = { 0 };
++		struct result_resp report_reply = { 0 };
++
++		if (!ask("which calibration files there are (none)", WLFW_CAL_REPORT, cal_report_req_ei, &report, result_resp_ei,
++		    &report_reply, false)) {
++			goto out;
++		}
++	}
++
++	if (upto < 6) {
++		goto out;
++	}
++
++	/* 6: what ath10k waits for before it powers the driver up */
++	if (wait_for(&wcn.fw_ready, seconds * 1000)) {
++		printf("wcn3990: %u: THE WI-FI FIRMWARE IS READY, %llu ms after the exchange began\n", step, now_ms() - wcn.began);
++	} else {
++		printf("wcn3990: %u: no \"firmware ready\" within %u s (the radio's supplies are as the boot loader left them)\n", step,
++		    seconds);
++	}
++out:
++	mark();                                 /* the last: the exchange is over */
++	printf("wcn3990: %u: over after %llu ms, steps up to %u (MSA ready said %s, pins said %s)\n", step, now_ms() - wcn.began,
++	    upto, wcn.msa_ready ? "yes" : "no", wcn.pins ? "yes" : "no");
++	qmi_handle_release(&handle);
++}
+diff --git a/xnu/files/bsd/sys/hakios.input.h b/xnu/files/bsd/sys/hakios.input.h
+index 7e8ce82..47f4c67 100644
+--- a/xnu/files/bsd/sys/hakios.input.h
++++ b/xnu/files/bsd/sys/hakios.input.h
+@@ -41,6 +41,8 @@ void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+ void hakios_input_init(void);
+ void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
+ void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
++void hakios_ilitek_init(void);         /* touchscreen=1 with hakios_board=x01a: the BALMUDA Phone's Ilitek touch screen */
++bool hakios_board_is(const char *name);        /* boot-arg hakios_board=NAME (the loader's platform; none: redwood) */
+ void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
+ void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
+ void hakios_ufs_report(const char *when); /* where reading the storage has spent its time so far */
+diff --git a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 407c8df..d20c496 100644
+--- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -111,6 +111,15 @@ static TUNABLE(uint32_t, gFBHeight, "fbheight", kFBDefaultHeight);
+ #define kFBPointsHigh           812
+ #define kFBDefaultScale         3
+ static TUNABLE(uint32_t, gFBScale, "fbscale", 0);
++/*
++ * Boot-arg fb_fit=1: the display in its own proportions, centred, instead of stretched to fill the
++ * panel (the BALMUDA Phone's 1080 x 1920 against the iPhone X's 1125 x 2436: 887 x 1920 in the
++ * middle, black at the sides). The touch screen's driver maps into the same rectangle.
++ */
++static TUNABLE(uint32_t, gFit, "fb_fit", 0);
++/* x, y, width, height of the display on the panel, then the panel's width and height (0: not yet) */
++extern "C" uint32_t hakios_fb_view[6];
++uint32_t hakios_fb_view[6];
+ /* Boot-arg fbtrace=N: log the first N calls of every selector (default 3). */
+ static TUNABLE(uint32_t, gFBTrace, "fbtrace", 3);
+ 
+@@ -229,6 +238,7 @@ public:
+ 	IOLock *        fLock;
+ 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
+ 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
++	uint32_t        fViewX, fViewY, fViewWidth, fViewHeight;        /* where on the panel the display goes */
+ 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
+ 	MiniIOSurface * fDefaultSurface;
+ 	uint32_t        fSwapID;
+@@ -439,12 +449,38 @@ IOMobileFramebuffer::start(IOService * provider)
+ 			}
+ 		}
+ 	}
++	fViewX = fViewY = 0;
++	fViewWidth = fPanelWidth;
++	fViewHeight = fPanelHeight;
++	if (gFit != 0 && (uint64_t) fWidth * fPanelHeight != (uint64_t) fHeight * fPanelWidth) {
++		/* the display's own proportions, as large as the panel allows, in the middle; the rest black */
++		if ((uint64_t) fWidth * fPanelHeight < (uint64_t) fHeight * fPanelWidth) {
++			fViewWidth = (uint32_t) ((uint64_t) fWidth * fPanelHeight / fHeight);
++			fViewX = (fPanelWidth - fViewWidth) / 2;
++		} else {
++			fViewHeight = (uint32_t) ((uint64_t) fHeight * fPanelWidth / fWidth);
++			fViewY = (fPanelHeight - fViewHeight) / 2;
++		}
++		for (uint32_t y = 0; y < fPanelHeight; y++) {
++			bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
++		}
++	}
++	hakios_fb_view[0] = fViewX;
++	hakios_fb_view[1] = fViewY;
++	hakios_fb_view[2] = fViewWidth;
++	hakios_fb_view[3] = fViewHeight;
++	hakios_fb_view[4] = fPanelWidth;
++	hakios_fb_view[5] = fPanelHeight;
+ 	fColumn = IONewZero(uint32_t, fPanelWidth);
+ 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
+ 	fDiff = gDiff != 0;
+ 	fDiffLeft = fDiffTop = ~0u;
+-	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
+-	    fPanelWidth, fPanelHeight, fRowBytes);
++	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)%s\n", fWidth, fHeight,
++	    fPanelWidth, fPanelHeight, fRowBytes, fViewWidth != fPanelWidth || fViewHeight != fPanelHeight ? "" : ", filling it");
++	if (fViewWidth != fPanelWidth || fViewHeight != fPanelHeight) {
++		IOLog("MiniIOMobileFramebuffer: in its own proportions (fb_fit): %ux%u at %u,%u of the panel\n", fViewWidth,
++		    fViewHeight, fViewX, fViewY);
++	}
+ 
+ 	if (gRecSeconds != 0) {
+ 		/* one piece of physical memory: the loader will send it over USB as it lies */
+@@ -739,10 +775,10 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
+ 		return;
+ 	}
+ 	/* the rectangle on the panel */
+-	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
+-	py0 = (int32_t) ((int64_t) dy * fPanelHeight / fHeight);
+-	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
+-	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
++	px0 = (int32_t) (fViewX + (int64_t) dx * fViewWidth / fWidth);
++	py0 = (int32_t) (fViewY + (int64_t) dy * fViewHeight / fHeight);
++	px1 = (int32_t) (fViewX + (int64_t) (dx + dw) * fViewWidth / fWidth);
++	py1 = (int32_t) (fViewY + (int64_t) (dy + dh) * fViewHeight / fHeight);
+ 	if (px1 <= px0 || py1 <= py0) {
+ 		return;
+ 	}
+diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
+index 63ffd4b..834ff9b 100644
+--- a/xnu/files/osfmk/arm64/gic_v3_irq.c
++++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
+@@ -72,7 +72,14 @@
+ 
+ #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
+ #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
+-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
++/*
++ * EL1 virtual timer PPI: 27 on redwood, as the architecture suggests, but the SoC decides. On the
++ * BALMUDA Phone (SM7250) its device tree has the timer on PPI 3, INTID 19. Boot-arg vtimer_intid=N
++ * (16 to 31) says which; the loader passes it for the phones that need it.
++ */
++static uint32_t gic_intid_vtimer = 27;
++static bool gic_vtimer_from_bootarg;    /* (then the timer is the kernel's alone, and goes quiet on the way back) */
++#define GIC_INTID_VTIMER        gic_intid_vtimer
+ #define GIC_INTID_SPI_MIN       32
+ #define GIC_INTID_SPURIOUS_MIN  1020
+ #define GIC_SPI_MOST            48          /* attached at a time */
+@@ -362,6 +369,16 @@ gic_v3_irq_quiesce(void)
+ 		__builtin_arm_isb(ISB_SY);
+ 		gic_active_iar[cpu] = 0;
+ 	}
++	/*
++	 * A timer on a PPI the firmware does not own (vtimer_intid=, the BALMUDA Phone's 19) must not
++	 * go on firing under it: UEFI's GIC driver takes it, calls it spurious, and takes it again.
++	 */
++	if (gic_vtimer_from_bootarg && gicr_cpu_base[cpu] != 0) {
++		__builtin_arm_wsr64("CNTV_CTL_EL0", 0);
++		__builtin_arm_isb(ISB_SY);
++		gic_write32(gicr_cpu_base[cpu] + GICR_ICENABLER0, 1u << GIC_INTID_VTIMER);
++		gic_write32(gicr_cpu_base[cpu] + GICR_ICPENDR0, 1u << GIC_INTID_VTIMER);
++	}
+ }
+ 
+ /*
+@@ -418,6 +435,13 @@ gic_v3_irq_cpu_init(void)
+ {
+ 	int cpu = cpu_number();
+ 	vm_offset_t gicr;
++	uint32_t intid;
++
++	if (cpu == 0 && PE_parse_boot_argn("vtimer_intid", &intid, sizeof(intid)) && intid >= 16 && intid < 32) {
++		gic_intid_vtimer = intid;
++		gic_vtimer_from_bootarg = true;
++	}
++
+ 	uint32_t mine = 1u << GIC_INTID_VTIMER;
+ 
+ 	if (gicd_base == 0) {

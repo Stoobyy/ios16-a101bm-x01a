@@ -6,7 +6,8 @@ the same.
 
 Status (2026-10-29): the modem boots, serves its files, starts its Wi-Fi domain, loads
 `wlanmdsp.mbn` and offers the Wi-Fi firmware's service (QRTR service 69, WLFW). 45 services in all,
-and the phone keeps running. Nothing talks to the Wi-Fi firmware yet.
+and the phone keeps running. With `wcn3990=1` the kernel then powers the radio and has ath10k's
+start-up exchange with the firmware (`hakios.wcn3990.c`), and the firmware says "firmware ready".
 
 ## What differs from the POCO
 
@@ -47,20 +48,41 @@ Copy `system.apfs`, `root.apfs`, the kernel and `xnuloader/mkpayload.py` to a lo
 (same layout). The first upload straight from the WSL share broke on USB.
 
 ```sh
-ARGS="cpus=8 touchscreen=1 buttons=1 modem_step=10 modem_listen=30 $(tr '\n' ' ' < modem/soc.args)" tools/run.sh LOCAL_DIR 180
+ARGS="cpus=8 touchscreen=1 buttons=1 modem_step=10 modem_listen=30 wcn3990=1 $(tr '\n' ' ' < modem/soc.args)" tools/run.sh LOCAL_DIR 220
 ```
 
-Look for `mpss: qrtr: a service: 69 (0x45)`. The modem is stopped after the last step.
+Look for `mpss: qrtr: a service: 69 (0x45)` and `wcn3990: ... THE WI-FI FIRMWARE IS READY`. The
+modem is stopped after the last step. `soc.args` holds only what differs from HakiOS's built-in
+values, and the IPA switches come first.
 
 - A modem that crashed (it didn't acknowledge the stop) is not started again. Reboot to Android
   first (`fastboot reboot`).
 - If the phone goes black and drops off USB, it is a hard hang. Hold power 15 s. The log is lost
   with it.
 
+## The Wi-Fi firmware
+
+`hakios.wcn3990.c`, after step 10 with `wcn3990=1`. What the phone said:
+
+| Step | What happens |
+|---|---|
+| 0 | The radio's supplies on through RPMh: ldoa1, ldoa14 1.8 V, ldoc2 1.304 V, ldoc10 and ldoc11 3.0 V. Left on after the run. |
+| 1 | Indications registered. Status word 0. |
+| 2 | MSA 0x8ba00000, 2 MB: the firmware makes a 64 KB secure region and the rest. TrustZone refuses every move of them (-2, 0x56). Android's icnss doesn't move them either ("hyperviser disabled"), so this is passed over. |
+| 3 | "MSA ready". |
+| 4 | Chip 0x320 of family 0x4001, no board id, firmware WLAN.HL.3.3.1-01557 (13 Oct 2022). |
+| 5 | `bdwlan.bin` (26 KB) in 5 pieces, then an empty calibration report. Without the report the firmware never gets ready. |
+| 6 | The pins' result (power 0x1, RF 0x1822b), then "firmware ready" 5.8 s after the report. Android takes 5.5 s. |
+
+Boot-args: `wcn3990_upto=N` stops after step N, `wcn3990_power=0` leaves the supplies alone,
+`wcn3990_marks=1` paints a band on the screen at each point (for runs that hang and lose the log).
+
+The kernel's boot-args hold 607 characters and the loader adds about 95. `tools/run.sh` refuses
+more than 500 of ours, after a cut-off line once dropped `modem_ipa=0` and hung the phone.
+
 ## Next
 
-1. WLFW: memory info, the board file (`bdwlan.*` in image/), mission mode. `hakios.wlfw.c` does this
-   for the WCN6750.
-2. The radio's supplies (the icnss node's `vdd-*`).
-3. The data path: ath10k SNOC copy engines at 0x18800000, behind the SMMU. HakiOS has ath11k only.
-4. The iOS side, `hakios.apple80211.c`, should mostly carry over.
+1. WLAN config and mode "mission" (two more WLFW messages).
+2. The data path: ath10k SNOC copy engines at 0x18800000, behind the SMMU. HakiOS has ath11k only.
+   This is the big piece.
+3. The iOS side, `hakios.apple80211.c`, should mostly carry over.
