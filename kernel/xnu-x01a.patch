@@ -1291,10 +1291,10 @@ index 15c8115..21e38a3 100644
  
 diff --git a/xnu/files/bsd/dev/hakios.wcn3990.c b/xnu/files/bsd/dev/hakios.wcn3990.c
 new file mode 100644
-index 0000000..c6090f5
+index 0000000..c0e92a3
 --- /dev/null
 +++ b/xnu/files/bsd/dev/hakios.wcn3990.c
-@@ -0,0 +1,775 @@
+@@ -0,0 +1,875 @@
 +/*
 + * The Wi-Fi firmware of the BALMUDA Phone (X01A), spoken to. The radio is a WCN3990; its firmware
 + * runs inside the modem (msm/modem/wlan_pd, which loads wlanmdsp.mbn), and once it is up it offers
@@ -1313,8 +1313,10 @@ index 0000000..c6090f5
 + *   4  what the chip and the firmware are (chip, board id, firmware version)
 + *   5  the board's data file, bdwlan.bXX for that board id (fw/image of the system image), in pieces
 + *   6  a wait for "firmware ready"
++ *   7  the WLAN configuration (the copy engines, the services on them, the shadow registers) and the
++ *      mode "mission"; two seconds later "off" again (ath10k's tables: see mission() below)
 + *
-+ * It stops there: no mode is asked for. It runs after the modem's step 10 (hakios.mpss.c) with
++ * It stops there. It runs after the modem's step 10 (hakios.mpss.c) with
 + * boot-arg wcn3990=1, while the modem's link is up, and the modem is shut down after it as after any
 + * run of the steps. The phone is to be rebooted before the modem is started again.
 + *
@@ -1855,6 +1857,94 @@ index 0000000..c6090f5
 +	return true;
 +}
 +
++/*
++ * Step 7, with ath10k's own descriptions of the two messages and its tables for this chip, which
++ * wlan-work/scripts/mk-wcn3990-tables.sh puts into the kernel's build directory from Linux's sources
++ * (they are not kept here). Without that header step 7 says so and is left out.
++ */
++#if __has_include("hakios.wcn3990_ath10k.h")
++#include "hakios.wcn3990_ath10k.h"
++
++#define COUNT(a)                (sizeof(a) / sizeof((a)[0]))
++
++/* ath10k_qmi_cfg_send_sync_msg() with snoc.c's tables, then ath10k_qmi_mode_send_sync_msg(QMI_WLFW_MISSION_V01) */
++static bool
++mission(uint32_t step)
++{
++	static struct wlfw_wlan_cfg_req_msg_v01 cfg;
++	struct wlfw_wlan_cfg_resp_msg_v01 cfg_reply = { 0 };
++	struct wlfw_wlan_mode_req_msg_v01 mode = { 0 };
++	struct wlfw_wlan_mode_resp_msg_v01 mode_reply = { 0 };
++
++	bzero(&cfg, sizeof(cfg));
++	cfg.tgt_cfg_valid = 1;
++	cfg.tgt_cfg_len = COUNT(target_ce_config_wlan) < QMI_WLFW_MAX_NUM_CE_V01 ? COUNT(target_ce_config_wlan) :
++	    QMI_WLFW_MAX_NUM_CE_V01;
++	for (uint32_t i = 0; i < cfg.tgt_cfg_len; i++) {
++		cfg.tgt_cfg[i].pipe_num = target_ce_config_wlan[i].pipenum;
++		cfg.tgt_cfg[i].pipe_dir = target_ce_config_wlan[i].pipedir;
++		cfg.tgt_cfg[i].nentries = target_ce_config_wlan[i].nentries;
++		cfg.tgt_cfg[i].nbytes_max = target_ce_config_wlan[i].nbytes_max;
++		cfg.tgt_cfg[i].flags = target_ce_config_wlan[i].flags;
++	}
++	cfg.svc_cfg_valid = 1;
++	cfg.svc_cfg_len = COUNT(target_service_to_ce_map_wlan) < QMI_WLFW_MAX_NUM_SVC_V01 ? COUNT(target_service_to_ce_map_wlan) :
++	    QMI_WLFW_MAX_NUM_SVC_V01;
++	for (uint32_t i = 0; i < cfg.svc_cfg_len; i++) {
++		cfg.svc_cfg[i].service_id = target_service_to_ce_map_wlan[i].service_id;
++		cfg.svc_cfg[i].pipe_dir = target_service_to_ce_map_wlan[i].pipedir;
++		cfg.svc_cfg[i].pipe_num = target_service_to_ce_map_wlan[i].pipenum;
++	}
++	cfg.shadow_reg_valid = 1;
++	cfg.shadow_reg_len = COUNT(target_shadow_reg_cfg_map) < QMI_WLFW_MAX_NUM_SHADOW_REG_V01 ? COUNT(target_shadow_reg_cfg_map) :
++	    QMI_WLFW_MAX_NUM_SHADOW_REG_V01;
++	memcpy(cfg.shadow_reg, target_shadow_reg_cfg_map, sizeof(struct wlfw_shadow_reg_cfg_s_v01) * cfg.shadow_reg_len);
++	printf("wcn3990: %u: the configuration: %u copy engines, %u services on them, %u shadow registers\n", step,
++	    cfg.tgt_cfg_len, cfg.svc_cfg_len, cfg.shadow_reg_len);
++	if (!ask("the WLAN configuration", QMI_WLFW_WLAN_CFG_REQ_V01, wlfw_wlan_cfg_req_msg_v01_ei, &cfg,
++	    wlfw_wlan_cfg_resp_msg_v01_ei, &cfg_reply, false)) {
++		return false;
++	}
++	mode.mode = QMI_WLFW_MISSION_V01;
++	mode.hw_debug_valid = 1;
++	mode.hw_debug = 0;
++	if (!ask("the mode \"mission\"", QMI_WLFW_WLAN_MODE_REQ_V01, wlfw_wlan_mode_req_msg_v01_ei, &mode,
++	    wlfw_wlan_mode_resp_msg_v01_ei, &mode_reply, false)) {
++		return false;
++	}
++	printf("wcn3990: %u: THE WI-FI FIRMWARE IS IN MISSION MODE: the radio is on, its copy engines are the driver's to use\n", step);
++	return true;
++}
++
++/* ath10k_qmi_wlan_disable() */
++static void
++mission_off(uint32_t step)
++{
++	struct wlfw_wlan_mode_req_msg_v01 mode = { 0 };
++	struct wlfw_wlan_mode_resp_msg_v01 mode_reply = { 0 };
++
++	mode.mode = QMI_WLFW_OFF_V01;
++	mode.hw_debug_valid = 1;
++	if (ask("the mode \"off\"", QMI_WLFW_WLAN_MODE_REQ_V01, wlfw_wlan_mode_req_msg_v01_ei, &mode, wlfw_wlan_mode_resp_msg_v01_ei,
++	    &mode_reply, false)) {
++		printf("wcn3990: %u: the radio is off again\n", step);
++	}
++}
++#else
++static bool
++mission(uint32_t step)
++{
++	printf("wcn3990: %u: STEP 7 IS NOT BUILT IN: ath10k's tables were not there when this kernel was built "
++	    "(wlan-work/scripts/mk-wcn3990-tables.sh, then build again)\n", step);
++	return false;
++}
++
++static void
++mission_off(__unused uint32_t step)
++{
++}
++#endif
++
 +/* ---- the exchange ------------------------------------------------------------------------------------- */
 +
 +void
@@ -1869,7 +1959,7 @@ index 0000000..c6090f5
 +	struct result_resp ready_reply = { 0 };
 +	static struct cap_resp target;
 +	uint64_t msa_address = MSA_DEFAULT;
-+	uint32_t msa_size = MSA_SIZE_DEFAULT, seconds = 15, upto = 6, power = 1;
++	uint32_t msa_size = MSA_SIZE_DEFAULT, seconds = 15, upto = 7, power = 1;
 +	int ret;
 +
 +	bzero(&wcn, sizeof(wcn));
@@ -2063,6 +2153,16 @@ index 0000000..c6090f5
 +	} else {
 +		printf("wcn3990: %u: no \"firmware ready\" within %u s (the radio's supplies are as the boot loader left them)\n", step,
 +		    seconds);
++		goto out;
++	}
++	if (upto < 7) {
++		goto out;
++	}
++
++	/* 7: ath10k_snoc_wlan_enable(): the configuration and the mode "mission"; "off" again before the modem stops */
++	if (mission(step)) {
++		delay_for_interval(2000, NSEC_PER_MSEC);
++		mission_off(step);
 +	}
 +out:
 +	mark();                                 /* the last: the exchange is over */

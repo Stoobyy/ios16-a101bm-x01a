@@ -73,6 +73,17 @@ values, and the IPA switches come first.
 | 4 | Chip 0x320 of family 0x4001, no board id, firmware WLAN.HL.3.3.1-01557 (13 Oct 2022). |
 | 5 | `bdwlan.bin` (26 KB) in 5 pieces, then an empty calibration report. Without the report the firmware never gets ready. |
 | 6 | The pins' result (power 0x1, RF 0x1822b), then "firmware ready" 5.8 s after the report. Android takes 5.5 s. |
+| 7 | The WLAN configuration (ath10k's 12 copy engines, 21 services on them, 12 shadow registers) and mode "mission", both taken. The radio is on; 2 s later mode "off", also taken. |
+
+Step 7 uses ath10k's own message descriptions and WCN3990 tables. They come from Linux 7.0.14's
+`drivers/net/wireless/ath/ath10k` through `tools/mk-wcn3990-tables.sh`, which writes them as a header
+into the kernel's build directory. Linux's text is not kept in this repository. Without the header
+the kernel still builds and step 7 says it is left out. After a first kernel build:
+
+```sh
+LINUX_SRC=path/to/linux-7.0.14 tools/mk-wcn3990-tables.sh HAKIOS_DIR    # cdn.kernel.org, sha256 de9999b7...
+./xnu-build.sh -j12 -k                                                  # in HAKIOS_DIR, again
+```
 
 Boot-args: `wcn3990_upto=N` stops after step N, `wcn3990_power=0` leaves the supplies alone,
 `wcn3990_marks=1` paints a band on the screen at each point (for runs that hang and lose the log).
@@ -82,7 +93,6 @@ more than 500 of ours, after a cut-off line once dropped `modem_ipa=0` and hung 
 
 ## Next
 
-1. WLAN config and mode "mission" (two more WLFW messages).
-2. The data path: ath10k SNOC copy engines at 0x18800000, behind the SMMU. HakiOS has ath11k only.
-   This is the big piece.
-3. The iOS side, `hakios.apple80211.c`, should mostly carry over.
+1. The data path: ath10k SNOC copy engines at 0x18800000, behind the SMMU, then HTC, WMI and HTT
+   over them. HakiOS has ath11k only. This is the big piece.
+2. The iOS side, `hakios.apple80211.c`, should mostly carry over.
