@@ -16,7 +16,7 @@ fi
 SRC=${XNU_SRC:-$H/xnu-src/xnu-8796.121.2}
 if [ -d "$SRC" ]; then
 	cp xnu/files/bsd/dev/hakios.ilitek.c xnu/files/bsd/dev/hakios.buttons.c xnu/files/bsd/dev/hakios.input.c \
-	    xnu/files/bsd/dev/hakios.goodix.c "$SRC/bsd/dev/"
+	    xnu/files/bsd/dev/hakios.goodix.c xnu/files/bsd/dev/hakios.mpss.c "$SRC/bsd/dev/"
 	cp xnu/files/bsd/sys/hakios.input.h "$SRC/bsd/sys/"
 	cp xnu/files/osfmk/arm64/gic_v3_irq.c "$SRC/osfmk/arm64/"
 	grep -q "hakios.ilitek.c" "$SRC/bsd/conf/files" ||

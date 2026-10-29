@@ -1140,3 +1140,98 @@
 +		thread_deallocate(thread);
 +	}
 +}
+--- a/xnu/files/bsd/dev/hakios.mpss.c
++++ b/xnu/files/bsd/dev/hakios.mpss.c
+@@ -1046,7 +1046,9 @@ step_survey(void)
+ 
+ #define MPSS_MEMORY_DEFAULT     0x8b800000u   /* dt: reserved-memory mpss@..., memory-region of qcom,mss */
+ static uint32_t mpss_memory = MPSS_MEMORY_DEFAULT;
+-#define MPSS_MEMORY_SIZE        0x0f600000u
++#define MPSS_MEMORY_SIZE_DEFAULT 0x0f600000u  /* dt: that region's size (the X01A's modem_wlan_region is 0x0f800000) */
++static uint32_t mpss_memory_size = MPSS_MEMORY_SIZE_DEFAULT;
++#define MPSS_MEMORY_SIZE        mpss_memory_size
+ #define PAS_MPSS_DEFAULT        4               /* dt: qcom,pas-id of qcom,mss */
+ static uint32_t pas_mpss = PAS_MPSS_DEFAULT;
+ 
+@@ -3591,6 +3593,28 @@ rmtfs_load(void)
+ 		uint64_t size = 0;
+ 		int error = hakios_ufs_read_partition(rmtfs_files[f].partition, 0, NULL, 0, &size);
+ 
++		if (error == ENXIO) {
++			/*
++			 * No storage (the X01A's loader cannot serve it while the kernel runs): a copy of the
++			 * partition in /fw of the system image, taken from the phone's Android, if there is one.
++			 */
++			uint8_t *copy = (uint8_t *)(uintptr_t)root_file(rmtfs_files[f].partition, &size);
++
++			if (copy != NULL && size <= (64u << 20)) {
++				if (rmtfs_files[f].data != NULL) {
++					kfree_data(rmtfs_files[f].data, rmtfs_files[f].size);
++				}
++				rmtfs_files[f].data = copy;
++				rmtfs_files[f].size = size;
++				printf("mpss: %u: the partition %s (%s): %llu bytes from /fw/%s, a copy taken from Android\n", step,
++				    rmtfs_files[f].partition, rmtfs_files[f].path, size, rmtfs_files[f].partition);
++				loaded++;
++				continue;
++			}
++			if (copy != NULL) {
++				kfree_data(copy, size);
++			}
++		}
+ 		if (error != 0 || size == 0 || size > (64u << 20)) {
+ 			printf("mpss: %u: the partition %s: %s (%d)\n", step, rmtfs_files[f].partition, error == ENXIO ?
+ 			    "no storage to read it from (the loader was not asked for ufs=2)" : "not read", error);
+@@ -4556,7 +4580,7 @@ jsn_string(const char *from, const char *end, const char *key, char *out, size_t
+ static void
+ servreg_load(void)
+ {
+-	static const char *const files[] = { "modemr.jsn", "adspr.jsn", "adsps.jsn", "adspua.jsn", "battmgr.jsn", "cdspr.jsn", "wpssr.jsn" };
++	static const char *const files[] = { "modemr.jsn", "modemuw.jsn", "adspr.jsn", "adsps.jsn", "adspua.jsn", "battmgr.jsn", "cdspr.jsn", "wpssr.jsn" };
+ 
+ 	servreg_maps = 0;
+ 	for (unsigned f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
+@@ -5003,9 +5027,22 @@ step_queues(void)
+ {
+ 	struct glink_message message;
+ 	uint32_t head, tail;
++	bool found;
+ 
+ 	announce("find GLINK's descriptor and the two queues, and read what the modem has put into its own");
+-	if (!glink_find()) {
++	found = glink_find();
++	if (!found && glink.descriptor != 0 && glink.ours == 0 && glink.theirs != 0) {
++		/*
++		 * The X01A's boot chain leaves our queue (479) to us: the modem makes the descriptor and its own
++		 * queue and waits for ours, which Linux's qcom_glink_smem_register() makes with 16 KB.
++		 */
++		uint32_t cacheline = 0, size = 0, partition = smem_partition(SMEM_US, SMEM_MPSS, &cacheline, &size);
++
++		printf("mpss: %u: our queue (item %u) is not there: made here, %u bytes, as Linux makes it\n", step,
++		    ITEM_GLINK_OUR_QUEUE, 16384);
++		found = partition != 0 && our_item_make(partition, ITEM_GLINK_OUR_QUEUE, 16384) && glink_find();
++	}
++	if (!found) {
+ 		printf("mpss: %u: GLINK's items are not all there, or not of a shape this knows (descriptor %#x, ours %#x of %u bytes, "
+ 		    "the DSP's %#x of %u)\n", step, glink.descriptor, glink.ours, glink.ours_size, glink.theirs, glink.theirs_size);
+ 		return false;
+@@ -6329,14 +6366,17 @@ soc_override(void)
+ 	PE_parse_boot_argn("soc_smem", &smem_phys, sizeof(smem_phys));
+ 	PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
+ 	PE_parse_boot_argn("soc_mpss_mem", &mpss_memory, sizeof(mpss_memory));
++	PE_parse_boot_argn("soc_mpss_size", &mpss_memory_size, sizeof(mpss_memory_size));
+ 	PE_parse_boot_argn("soc_imem", &ipa_imem, sizeof(ipa_imem));
+ 	PE_parse_boot_argn("soc_ipa_stream", &ipa_stream, sizeof(ipa_stream));
+ 	PE_parse_boot_argn("soc_ipa_stream_uc", &ipa_stream_uc, sizeof(ipa_stream_uc));
+ 	PE_parse_boot_argn("soc_pas_mpss", &pas_mpss, sizeof(pas_mpss));
+ 	PE_parse_boot_argn("soc_pas_ipa", &pas_ipa, sizeof(pas_ipa));
+-	if (said != 0 || smem_phys != SMEM_PHYS_DEFAULT || mpss_memory != MPSS_MEMORY_DEFAULT) {
++	if (said != 0 || smem_phys != SMEM_PHYS_DEFAULT || mpss_memory != MPSS_MEMORY_DEFAULT ||
++	    mpss_memory_size != MPSS_MEMORY_SIZE_DEFAULT) {
+ 		printf("mpss: SoC addresses from boot-args: %u register blocks; shared memory %#x, command DB %#x, the modem's "
+-		    "memory %#x, the SoC's internal memory %#x\n", said, smem_phys, cmd_db_phys, mpss_memory, ipa_imem);
++		    "memory %#x (%#x bytes), the SoC's internal memory %#x\n", said, smem_phys, cmd_db_phys, mpss_memory,
++		    mpss_memory_size, ipa_imem);
+ 	}
+ }
+ 
