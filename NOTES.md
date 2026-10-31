@@ -51,10 +51,38 @@ What was found while bringing this up, for whoever picks up the next piece.
   returned fine.
 - The time zone comes from the image build (`tools/build_userland.sh HAKIOS_DIR Asia/Kolkata`).
 
-## Next pieces, roughly by size
+## Next pieces, roughly by size (historical list; Wi-Fi update below)
 
 - Sound, speaker only: the audio DSP (APR protocol on this SoC), then the NXP TFA98xx amplifier on
   I2C (i2c@880000, 0x34). The headphone side is a WCD938x on SoundWire behind the Bolero codec.
 - GPU: Adreno 620 against HakiOS's Adreno 642L driver, same family, every address different.
 - Wi-Fi: the WCN3990's firmware runs on the modem DSP, so the modem has to be brought up first,
   then an ath10k SNOC port through HakiOS's Linux shim.
+
+## Wi-Fi integration, 2026-10-31
+
+The formerly separate GLM/Codex WCN3990 work is integrated in `kernel/xnu-wifi.patch`,
+`wifi/` and `tools/build_wifi*`. `kernel/apply.sh` applies both kernel layers; `tools/run.sh`
+is the common launcher. The old experimental folder is not a build dependency.
+
+Hardware-verified: scanning, WPA2 association/four-way handshake, key installation, DHCP,
+global IPv4/DNS selection, Safari, and the Settings network picker. The successful picker
+path auto-joins first, then offers the existing station callbacks to iOS. Bootstrap retries
+at most three times on ETIMEDOUT. Unjoined station-only mode remains unstable and is not the
+recommended mode. Signal-strength display, switching/rejoin and long-duration stability
+remain incomplete or unverified. A late USB-return failure is still possible.
+
+The main fixes are the DMA mapper's missing output address, live SMMU SID mask/mappings,
+early 44 MiB contiguous-pool reservation, CE pending-bit filtering/start gating and callback
+lifetime synchronization. Stop the radio before its modem transport. The source checkpoints
+remain available for diagnosis; a clean driver build has 29 objects, zero compile failures,
+zero generated stubs and zero missing symbols.
+
+On iOS, DHCP alone did not make en0 primary. The helper publishes a matching Setup service
+using the actual DHCP service ID. CaptiveNetworkSupport held a configd-owned Never rank on
+en0; excluding that plugin removed the restriction, enabling default TCP, DNS and HTTP200.
+Captive-portal support is deliberately disabled at the owner's request. The private root image
+contains a network credential and must never be committed or shared. See `wifi/README.md`.
+
+`battery=1` remains excluded. Keep the 500-character boot-argument guard and all X01A modem
+memory/IPA/NAV overrides. No automatic reboot/watchdog fix was added.

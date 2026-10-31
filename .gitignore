@@ -2,3 +2,17 @@ out/
 __pycache__/
 *.img
 *.bin
+
+# Local firmware, source archives, credentials, images and test/build output.
+downloads/
+private/
+known-good/
+run/
+build/
+*.apfs
+*.o
+*.dSYM/
+*.log
+*.raw
+fw-modem/
+fw-wifi/

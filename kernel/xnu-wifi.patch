@@ -1,0 +1,668 @@
+--- a/xnu/files/bsd/dev/hakios.lx.c
++++ b/xnu/files/bsd/dev/hakios.lx.c
+@@ -60,6 +60,22 @@
+  * in between (as hakios.adreno.c does with what it shares with the GPU); the first, cached
+  * view is written out and never used again.
+  */
++/* Reserve the driver's pool before iOS fragments contiguous physical memory. */
++static vm_offset_t lx10k_reserved;
++static vm_size_t lx10k_reserved_size;
++void
++hakios_lx10k_reserve(void)
++{
++	uint32_t enabled = 0;
++	if (!PE_parse_boot_argn("wlan_ath10k", &enabled, sizeof(enabled)) || !enabled) return;
++	lx10k_reserved_size = round_page(44 * 1024 * 1024);
++	if (kmem_alloc_contig(kernel_map, &lx10k_reserved, lx10k_reserved_size, 0, 0, 0,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		lx10k_reserved = 0;
++		printf("lx10k: early radio pool reservation failed\n");
++	} else printf("lx10k: reserved 44 MiB radio pool before userland\n");
++}
++
+ void *
+ lx_os_radio_memory(unsigned long size, unsigned long long *address)
+ {
+@@ -67,7 +83,10 @@
+ 	uint64_t physical;
+ 
+ 	size = round_page(size);
+-	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
++	if (lx10k_reserved != 0 && size == lx10k_reserved_size) {
++		cached = lx10k_reserved;
++		lx10k_reserved = 0;
++	} else if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+ 	    KERN_SUCCESS) {
+ 		say("lx: no %lu bytes of memory in one piece\n", size);
+ 		return NULL;
+--- /dev/null
++++ b/xnu/files/bsd/dev/hakios.lx10k.c
+@@ -0,0 +1,514 @@
++/*
++ * The kernel's side of ath10k on the BALMUDA Phone (X01A), in the way hakios.lx.c and
++ * hakios.wifi.c are the sides of ath11k on the other phone. The WCN3990's firmware runs in
++ * the modem (hakios.mpss.c's steps bring the modem up as far as step 10, whose QRTR link has
++ * the WLFW service), and after those steps one boot-arg, wlan_ath10k=1, hands the radio to
++ * ath10k instead of the hand-written exchange of hakios.wcn3990.c. What is done here is, in
++ * order:
++ *
++ *   the radio's five supplies on, through RPMh, as the old exchange's power_on() did (the
++ *     driver's own regulator calls are no-ops on the driver's side);
++ *   the QMI helpers (hakios.qmi.c) given the modem's QRTR, so that ath10k's qmi.c speaks with
++ *     the WLFW service as it does on Linux;
++ *   the radio's view of memory: the application processors' SMMU gets a context of ours for
++ *     the stream of the WLAN's VM (dt: iommus of qcom,wcn3990-wifi, stream 0xc0; no mask
++ *     beside it, so an exact match register), and everything ath10k allocates for the
++ *     copy engines is mapped into it, the radio seeing each piece at its own physical
++ *     address. This is the same machinery as hakios.mpss.c makes for the IPA, whose
++ *     programming order and formats are those of hakios.wifi.c's radio_space_on(); there the
++ *     hypervisor's grants and this phone's rules were proved, and are counted on here.
++ *   the files the driver asks for by Linux's names: its board data is the modem's image/
++ *     bdwlan.bin (there is no board id on this phone), and firmware-5.bin is a file of
++ *     capability only, sixty bytes, which Linux's tree carries as a file and is placed here;
++ *   hakios_lx_start(), which is ath10k: its probe on the device this file's platform side has
++ *     made, its exchange with the firmware, its copy engines, then htc_wait_target().
++ *
++ * The modem stays up for the driver (the run is made with modem_keep=1). The SMMU's context
++ * and the supplies stay as they are left: the run of the steps ends with them on, and they
++ * are this kernel's to leave behind for now.
++ */
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/hakios.input.h>
++#include <sys/hakios.qmi.h>
++#include <sys/hakios.qrtr.h>
++#include <sys/systm.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
++extern const struct hakios_qrtr_ops *hakios_mpss_qrtr(void);
++extern bool hakios_mpss_vrm(const char *name, uint32_t offset, uint32_t value);
++extern const uint8_t *hakios_mpss_file(const char *name, uint64_t *size);
++extern lck_mtx_t hakios_smmu_lock;              /* (hakios.wifi.c's: the sound and the steps of the SMMU share it) */
++
++static LCK_GRP_DECLARE(lx10k_lock_group, "hakios-lx10k");
++static LCK_MTX_DECLARE(lx10k_lock, &lx10k_lock_group);
++
++static bool on;                         /* wlan_ath10k=1 was asked for */
++static uint32_t step;                   /* the modem's steps' number, for the lines */
++
++extern void loader_log_putc(char c);
++static int
++lx10k_say(const char *format, ...) __printflike(1, 2);
++
++int
++lx10k_say(const char *format, ...)
++{
++	va_list argument;
++	char line[512];
++
++	va_start(argument, format);
++	vsnprintf(line, sizeof(line), format, argument);
++	va_end(argument);
++	for (const char *c = "lx10k: "; *c; c++) loader_log_putc(*c);
++	for (const char *c = line; *c; c++) loader_log_putc(*c);
++	loader_log_putc('\n');
++	printf("lx10k: %s\n", line);
++	return 0;
++}
++
++/* ---- the files the driver asks for: board.bin and firmware-5.bin -------------------------------------- */
++
++/*
++ * ath10k/WCN3990/hw1.0/firmware-5.bin, Linux's tree (linux-firmware), 60 bytes: just the IE
++ * file's header, magic and firmware version and the capability entries -- the WMI/HTT versions
++ * among them. The firmware's code is not in it: for this chip it runs in the modem.
++ */
++static const uint8_t firmware5[] = {
++	0x51, 0x43, 0x41, 0x2d, 0x41, 0x54, 0x48, 0x31, 0x30, 0x4b, 0x00, 0x77, 0x01, 0x00, 0x00, 0x00,
++	0x04, 0x00, 0x00, 0x00, 0xa4, 0xe4, 0xbe, 0x5b, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
++	0x40, 0x00, 0x0c, 0x77, 0x05, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++	0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
++};
++
++const uint8_t *
++hakios_lx10k_driver_file(const char *name, uint64_t *size)
++{
++	const char *last = strrchr(name, '/');
++
++	last = last == NULL ? name : last + 1;
++	if (strcmp(last, "firmware-5.bin") == 0) {
++		lx10k_say("the driver's %s: the piece of the tree, %lu bytes", name, sizeof(firmware5));
++		*size = sizeof(firmware5);
++		return firmware5;
++	}
++	if (strcmp(last, "board.bin") == 0) {
++		uint64_t length = 0;
++		const uint8_t *file = hakios_mpss_file("image/bdwlan.bin", &length);
++
++		if (file == NULL) {
++			lx10k_say("THE BOARD FILE IS NOT THERE (fw/image/bdwlan.bin): the driver goes on without it");
++			return NULL;
++		}
++		lx10k_say("the driver's %s: the modem's image/bdwlan.bin, %llu bytes", name, length);
++		/* (hakios_mpss_file()'s memory is not given back: the driver keeps it the whole time) */
++		*size = length;
++		return file;
++	}
++	return NULL;
++}
++
++/* ---- the radio's supplies, as the old exchange put them on ------------------------------------------------------------ */
++
++#define LX10K_VRM_VOLTAGE       0
++#define LX10K_VRM_ENABLE        4
++#define LX10K_VRM_MODE          8
++#define LX10K_VRM_MODE_HPM      7               /* Linux: RPMH_REGULATOR_MODE_HPM of a PMIC4/5 LDO */
++
++static bool
++lx10k_power_on(void)
++{
++	static const struct {
++		const char *supply, *resource;
++		uint32_t millivolts;            /* 0: as it is */
++	} rails[] = {
++		{ "vdd-cx-mx", "ldoa1", 0 },            /* pm8150 l1 */
++		{ "vdd-1.8-xo", "ldoa14", 1800 },       /* pm8150 l14 */
++		{ "vdd-1.3-rfa", "ldoc2", 1304 },       /* pm8150a l2 */
++		{ "vdd-3.3-ch0", "ldoc10", 3000 },      /* pm8150a l10 */
++		{ "vdd-3.3-ch1", "ldoc11", 3000 },      /* pm8150a l11 */
++	};
++
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		bool ok = (rails[i].millivolts == 0 || hakios_mpss_vrm(rails[i].resource, LX10K_VRM_VOLTAGE, rails[i].millivolts)) &&
++		    hakios_mpss_vrm(rails[i].resource, LX10K_VRM_MODE, LX10K_VRM_MODE_HPM) &&
++		    hakios_mpss_vrm(rails[i].resource, LX10K_VRM_ENABLE, 1);
++
++		lx10k_say("the radio's %s (%s)%s: %s", rails[i].supply, rails[i].resource,
++		    rails[i].millivolts ? ", at its voltage" : "", ok ? "ON" : "NOT ON (RPMh did not say done)");
++		if (!ok) {
++			return false;
++		}
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	return true;
++}
++
++/* ---- the radio's view of memory: the WLAN stream of the application processors' SMMU ------------------------------- */
++
++/*
++ * What the radio reads and writes in memory by itself (its copy engines, the rings of the data
++ * path) goes through the application processors' SMMU as stream 0xc0 (dt: iommus of
++ * qcom,wcn3990-wifi, with no mask beside the stream), on the same SMMU the IPA's context was
++ * made in (hakios.mpss.c, 0x15000000, an Arm MMU-500). What the radio is to see is mapped the
++ * way it is on Linux's device tree for this phone built for it: at its own physical address,
++ * so that what the driver hands out for a ring is the address of the memory itself.
++ */
++static struct block {
++	const char *name;
++	uint32_t phys, size;
++	vm_offset_t base;
++} apps_smmu = { "apps smmu", 0x15000000, 0x2000 },
++  apps_smmu_second = { "apps smmu", 0, 0x1000 },                /* the second page: a word per context */
++  apps_smmu_context = { "apps smmu, the WLAN stream's context", 0, 0x1000 };
++
++#define SMMU_SCR0               0x000           /* bit 0: the whole SMMU off; bit 10: a stream nobody matches faults; bit 3:
++	                                         * streams are numbered with 16 bits */
++#define SMMU_IDR0               0x020           /* [7:0] stream match registers */
++#define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */
++#define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
++#define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
++#define LX10K_STREAM            0x0c0
++
++#define LX10K_TABLES            64              /* of 4K: the root, and one of the second level per gigabyte mapped */
++#define LX10K_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)  /* a page; for requests of either
++	                                                                                  * privilege; shared, accessed, not
++	                                                                                  * global: Linux's for a device */
++#define PTE_ADDRESS             0x0000fffffffff000ull
++#define SMMU_SGFSR              0x048           /* what the SMMU as a whole has refused ... */
++#define SMMU_SGFSYNR0           0x050
++#define SMMU_SGFSYNR1           0x054           /* ... and of which stream */
++#define SMMU_CBAR(n)            (4 * (n))       /* in the second page; [17:16] kind of context */
++#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)       /* our tables alone decide; weakest defaults */
++#define SMMU_CBA2R(n)           (0x800 + 4 * (n))
++#define SMMU_CBA2R_64_BIT       1
++#define SMMU_CB_SCTLR           0x00            /* a context's own page: bit 0 = translation on */
++#define SMMU_CB_TCR2            0x10
++#define SMMU_CB_TTBR0           0x20
++#define SMMU_CB_TTBR1           0x28
++#define SMMU_CB_TCR             0x30
++#define SMMU_CB_MAIR0           0x38
++#define SMMU_CB_MAIR1           0x3c
++#define SMMU_CB_FSR             0x58
++#define SMMU_CB_FAR             0x60
++#define SMMU_CB_FSYNR0          0x68
++#define SMMU_CB_TLBIASID        0x610
++#define SMMU_CB_TLBSYNC         0x7f0
++#define SMMU_CB_TLBSTATUS       0x7f4
++#define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 8 | 1u << 12)
++#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)   /* one table of 4K pages, cached walks */
++#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)       /* 36 bits of physical address, 16 of context tag */
++#define SMMU_MAIR0              0xf404ff44      /* Linux's: 0 uncached, 1 cached, 2 device */
++#define SMMU_FSR_ALL            0xc00001fe      /* every kind of fault, and "several" */
++
++static void __attribute__((noinline))
++wxr(vm_offset_t address, uint32_t value)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (value), "r" (address) : "memory");
++}
++
++static uint32_t __attribute__((noinline))
++rxd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static bool
++lx10k_block_need(struct block *b)
++{
++	if (b->base == 0) {
++		lx10k_say("mapping %s registers at %#x, size %#x", b->name, b->phys, b->size);
++		b->base = ml_io_map(b->phys, b->size);
++		lx10k_say("mapped %s registers: %s", b->name, b->base ? "yes" : "FAILED");
++	}
++	return b->base != 0;
++}
++
++/* Until every write to memory so far has been carried out. */
++static void
++lx10k_settle(void)
++{
++	__asm__ volatile ("dsb sy");
++}
++
++static void
++lx10k_sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++static struct {
++	bool found, on;				/* (reset never comes back through here; what is taken is left as it is) */
++	uint32_t page, pages;           /* of the SMMU's registers: a page's size, and how many before the contexts' */
++	uint32_t match, context;        /* the stream match register and the context taken for the radio */
++	uint32_t old_smr, old_s2cr, old_sctlr;
++	vm_offset_t tables;             /* LX10K_TABLES of them, the root first */
++	uint32_t table_count;
++} lx10k_space;
++
++static uint64_t *
++lx10k_table(uint32_t n)
++{
++	return (uint64_t *)(lx10k_space.tables + 4096 * n);
++}
++
++/* The table an entry of a higher table leads to; made if the entry is empty. */
++static uint64_t *
++lx10k_next(uint64_t *entry)
++{
++	uint64_t *table;
++
++	if (*entry & 1) {
++		for (uint32_t i = 0; i < lx10k_space.table_count; i++) {
++			if (kvtophys((vm_offset_t)lx10k_table(i)) == (*entry & PTE_ADDRESS)) {
++				return lx10k_table(i);
++			}
++		}
++		return NULL;
++	}
++	if (lx10k_space.table_count == LX10K_TABLES) {
++		return NULL;
++	}
++	table = lx10k_table(lx10k_space.table_count++);
++	*entry = kvtophys((vm_offset_t)table) | 3;
++	return table;
++}
++
++/* Our memory at `physical` behind the same address for the radio; the SMMU reads the tables from memory. */
++static bool
++lx10k_enter(uint64_t physical, uint64_t size)
++{
++	uint64_t at = physical;
++
++	if (lx10k_space.tables == 0) {
++		if (kmem_alloc(kernel_map, &lx10k_space.tables, round_page(4096 * LX10K_TABLES), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return false;
++		}
++		lx10k_space.table_count = 1;
++	}
++	for (uint64_t offset = 0; offset < size; offset += 4096, at = physical + offset) {
++		uint64_t *level2 = lx10k_next(&lx10k_table(0)[at >> 30 & 0x1ff]);
++		uint64_t *level3 = level2 == NULL ? NULL : lx10k_next(&level2[at >> 21 & 0x1ff]);
++
++		if (level3 == NULL) {
++			lx10k_say("no page table left for the radio's %#llx", at);
++			return false;
++		}
++		level3[at >> 12 & 0x1ff] = (physical + offset) | LX10K_PTE;
++	}
++	for (vm_offset_t line = lx10k_space.tables; line < lx10k_space.tables + 4096 * LX10K_TABLES; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line));
++	}
++	lx10k_settle();
++	return true;
++}
++
++/* Which match register and which context are free; nothing is written. */
++static bool
++lx10k_space_find(void)
++{
++	bool used[256] = { false };
++	if (!lx10k_block_need(&apps_smmu)) {
++		lx10k_say("cannot map SMMU global registers");
++		return false;
++	}
++	lx10k_say("reading SMMU SCR0");
++	uint32_t scr0 = rxd(apps_smmu.base + SMMU_SCR0);
++	lx10k_say("SCR0 %#x; reading IDR0", scr0);
++	uint32_t idr0 = rxd(apps_smmu.base + SMMU_IDR0);
++	lx10k_say("IDR0 %#x; reading IDR1", idr0);
++	uint32_t idr1 = rxd(apps_smmu.base + SMMU_IDR1);
++	lx10k_say("IDR1 %#x", idr1);
++	uint32_t matches = idr0 & 0xff, contexts = idr1 & 0xff;
++
++	if (scr0 & 1u << 3) {
++		lx10k_say("this SMMU numbers its streams with 16 bits, which nothing here is written for");
++		return false;
++	}
++	lx10k_space.page = idr1 >> 31 ? 0x10000 : 0x1000;
++	lx10k_space.pages = 2u << (idr1 >> 28 & 7);
++	if (2 * lx10k_space.pages * lx10k_space.page != 0x100000) {      /* dt: "reg" of apps-smmu */
++		lx10k_say("the SMMU says it has 2 x %u pages of %#x bytes, which is not the megabyte the device tree gives "
++		    "it: its contexts are not looked for", lx10k_space.pages, lx10k_space.page);
++		return false;
++	}
++	lx10k_space.match = ~0u;
++	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
++		uint32_t smr = rxd(apps_smmu.base + SMMU_SMR(n)), s2cr = rxd(apps_smmu.base + SMMU_S2CR(n));
++
++		if (smr >> 31) {
++			lx10k_say("match register %u is in use: stream %#x mask %#x, s2cr %#x", n, smr & 0x7fff, smr >> 16 & 0x7fff,
++			    s2cr);
++			used[s2cr & 0xff] = true;
++		} else if (lx10k_space.match == ~0u) {
++			lx10k_space.match = n;
++			lx10k_space.old_smr = smr;
++			lx10k_space.old_s2cr = s2cr;
++		}
++	}
++	for (lx10k_space.context = 0; lx10k_space.context < contexts && used[lx10k_space.context]; lx10k_space.context++) {
++	}
++	if (lx10k_space.match == ~0u || lx10k_space.context >= contexts) {
++		lx10k_say("the SMMU has no match register or no context left");
++		return false;
++	}
++	apps_smmu_second.phys = apps_smmu.phys + lx10k_space.page;
++	apps_smmu_context.phys = apps_smmu.phys + (lx10k_space.pages + lx10k_space.context) * lx10k_space.page;
++	lx10k_say("free: match register %u (smr %#x, s2cr %#x) and context %u, whose registers are at %#x; the SMMU's pages "
++	    "are of %#x bytes, %u before the contexts'", lx10k_space.match, lx10k_space.old_smr, lx10k_space.old_s2cr,
++	    lx10k_space.context, apps_smmu_context.phys, lx10k_space.page, lx10k_space.pages);
++	if (!lx10k_block_need(&apps_smmu_second) || !lx10k_block_need(&apps_smmu_context)) {
++		lx10k_say("cannot map SMMU context registers");
++		return false;
++	}
++	lx10k_space.old_sctlr = rxd(apps_smmu_context.base + SMMU_CB_SCTLR);
++	lx10k_say("the context's sctlr as found: %#x", lx10k_space.old_sctlr);
++	if (lx10k_space.old_sctlr & 1) {
++		lx10k_say("CONTEXT %u IS SWITCHED ON although no stream is sent through it: it is somebody's, and is left "
++		    "alone", lx10k_space.context);
++		return false;
++	}
++	lx10k_space.found = true;
++	return true;
++}
++
++/* What the SMMU has recorded of requests of the radio's that it could not serve. */
++void
++hakios_lx10k_radio_faults(void)
++{
++	uint32_t status, global;
++
++	if (!lx10k_space.on) {
++		return;
++	}
++	status = rxd(apps_smmu_context.base + SMMU_CB_FSR);
++	global = rxd(apps_smmu.base + SMMU_SGFSR);
++	if ((status & SMMU_FSR_ALL) == 0 && global == 0) {
++		lx10k_say("the SMMU has refused the radio nothing (context %u: fsr %#x; sgfsr 0)", lx10k_space.context, status);
++		return;
++	}
++	lx10k_say("THE SMMU HAS REFUSED A REQUEST: context %u: status %#x, address %#llx, syndrome %#x; the SMMU as a whole: "
++	    "status %#x, syndromes %#x %#x (the second names the stream)", lx10k_space.context, status,
++	    (uint64_t)rxd(apps_smmu_context.base + SMMU_CB_FAR + 4) << 32 | rxd(apps_smmu_context.base + SMMU_CB_FAR),
++	    rxd(apps_smmu_context.base + SMMU_CB_FSYNR0), global, rxd(apps_smmu.base + SMMU_SGFSYNR0),
++	    rxd(apps_smmu.base + SMMU_SGFSYNR1));
++}
++
++/* The radio's stream through a context with our tables. */
++static bool
++lx10k_space_on(void)
++{
++	uint32_t smr = SMMU_SMR(lx10k_space.match), s2cr = SMMU_S2CR(lx10k_space.match),
++	    sees = 1u << 31 | 1u << 16 | LX10K_STREAM;		/* match 0: the stream and nothing beside it */
++	uint64_t root = kvtophys(lx10k_space.tables);
++
++	lx10k_sleep_ms(1000);
++	wxr(apps_smmu_context.base + SMMU_CB_SCTLR, 0);
++	wxr(apps_smmu_second.base + SMMU_CBA2R(lx10k_space.context), SMMU_CBA2R_64_BIT);
++	wxr(apps_smmu_second.base + SMMU_CBAR(lx10k_space.context), SMMU_CBAR_STAGE_1);
++	wxr(apps_smmu_context.base + SMMU_CB_TCR2, SMMU_TCR2);
++	wxr(apps_smmu_context.base + SMMU_CB_TCR, SMMU_TCR_39_BITS);
++	wxr(apps_smmu_context.base + SMMU_CB_TTBR0, (uint32_t)root);
++	wxr(apps_smmu_context.base + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32));
++	wxr(apps_smmu_context.base + SMMU_CB_TTBR1, 0);
++	wxr(apps_smmu_context.base + SMMU_CB_TTBR1 + 4, 0);
++	wxr(apps_smmu_context.base + SMMU_CB_MAIR0, SMMU_MAIR0);
++	wxr(apps_smmu_context.base + SMMU_CB_MAIR1, 0);
++	wxr(apps_smmu_context.base + SMMU_CB_FSR, SMMU_FSR_ALL);
++	wxr(apps_smmu_context.base + SMMU_CB_TLBIASID, lx10k_space.context);
++	wxr(apps_smmu_context.base + SMMU_CB_TLBSYNC, 1);
++	for (unsigned ms = 0; rxd(apps_smmu_context.base + SMMU_CB_TLBSTATUS) & 1; ms++) {
++		if (ms == 100) {
++			lx10k_say("the SMMU does not finish forgetting old translations");
++			return false;
++		}
++		lx10k_sleep_ms(1);
++	}
++	wxr(apps_smmu_context.base + SMMU_CB_SCTLR, SMMU_SCTLR_ON);
++	lx10k_space.on = true;          /* (from here on there is something to leave behind) */
++	wxr(apps_smmu.base + s2cr, lx10k_space.context);
++	wxr(apps_smmu.base + smr, sees);
++	lx10k_settle();
++
++	/* the global ones are the hypervisor's to grant: see what it made of them */
++	if (rxd(apps_smmu.base + smr) != sees || (rxd(apps_smmu.base + s2cr) & 0x300ff) != lx10k_space.context ||
++	    (rxd(apps_smmu_second.base + SMMU_CBAR(lx10k_space.context)) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
++	    !(rxd(apps_smmu_context.base + SMMU_CB_SCTLR) & 1) ||
++	    rxd(apps_smmu_context.base + SMMU_CB_TTBR0) != (uint32_t)root ||
++	    rxd(apps_smmu_context.base + SMMU_CB_TTBR0 + 4) != (uint32_t)(root >> 32)) {
++		lx10k_say("THE SMMU DID NOT TAKE WHAT WAS WRITTEN: stream %#x is not going through context %u", LX10K_STREAM,
++		    lx10k_space.context);
++		return false;
++	}
++	lx10k_say("THE RADIO'S STREAM GOES THROUGH CONTEXT %u of the SMMU, with our page tables", lx10k_space.context);
++	hakios_lx10k_radio_faults();
++	return true;
++}
++
++/* For the driver (hakios.lx.c): memory of ours that the radio is to see, at its own physical address. */
++bool
++hakios_lx10k_radio_map(uint64_t physical, uint64_t size, unsigned long long *address)
++{
++	if (address == NULL || size == 0 || (physical & 4095) ||
++	    size > (1ull << 35) - 4095 || physical >= (1ull << 35)) return false;
++	size = (size + 4095) & ~4095ull;
++	if (size > (1ull << 35) - physical) return false;
++	lck_mtx_lock(&hakios_smmu_lock);
++	if ((!lx10k_space.found && !lx10k_space_find()) || !lx10k_enter(physical, size)) {
++		lck_mtx_unlock(&hakios_smmu_lock);
++		return false;
++	}
++	if (!lx10k_space.on) {
++		bool ok = lx10k_space_on();
++
++		if (ok) *address = physical;
++		lck_mtx_unlock(&hakios_smmu_lock);
++		return ok;
++	}
++	lck_mtx_unlock(&hakios_smmu_lock);
++	*address = physical;
++	lx10k_say("the radio is to see %llu KB of ours at its own address %#llx", size >> 10, physical);
++	return true;
++}
++
++/* Did this kernel's run ask for ath10k (the boot-arg wlan_ath10k of hakios.mpss.c's hook)? */
++bool
++hakios_lx10k_wants(void)
++{
++	return on;
++}
++
++/* After the modem's steps are over (hakios.mpss.c): the radio to ath10k, and the driver with it. */
++void
++hakios_lx10k_start(uint32_t steps_done)
++{
++	int error;
++
++	on = true;
++	step = steps_done;
++	lx10k_say("the modem is up and linked (step %u): the radio goes to ath10k", steps_done);
++
++	if (!lx10k_power_on()) {
++		lx10k_say("THE RADIO'S SUPPLIES DID NOT COME ON: it is not brought up");
++		return;
++	}
++	hakios_qmi_set_transport(hakios_mpss_qrtr());
++	lx10k_say("the QMI helpers' transport is the modem's QRTR");
++
++	/* lx_prepare() -- which takes the memory the radio is shown -- is lx_start() itself's */
++	error = hakios_lx_start();
++	hakios_lx10k_radio_faults();
++	lx10k_say("the driver's start returns %d", error);
++}
+--- a/xnu/files/bsd/dev/hakios.mpss.c
++++ b/xnu/files/bsd/dev/hakios.mpss.c
+@@ -6352,6 +6352,7 @@
+ 
+ static bool keep;                       /* the DSP and the link stay up while the system runs (modem_keep, modem=1) */
+ extern void hakios_wcn3990_exchange(uint32_t step);
++extern void hakios_lx10k_start(uint32_t step);
+ 
+ static void
+ steps_over(uint32_t done)
+@@ -6369,6 +6370,9 @@
+ void
+ hakios_mpss_stop(void)
+ {
++	/* ath10k must release its station and DMA before its modem transport stops. */
++	extern void hakios_lx_stop(void);
++	if (option("wlan_ath10k")) hakios_lx_stop();
+ 	nas_stop();                             /* the questions first, while the modem still listens */
+ 	lck_mtx_lock(&dsp_lock);
+ 	if (dsp_started) {
+@@ -6421,6 +6425,14 @@
+ 		/* the X01A's Wi-Fi firmware, inside the modem (hakios.wcn3990.c) */
+ 		if (done == last_step && done >= 10 && PE_parse_boot_argn("wcn3990", &wcn, sizeof(wcn)) && wcn != 0) {
+ 			hakios_wcn3990_exchange(done);
++		}
++		{
++			uint32_t wlan10k = 0;
++
++			/* the same radio, to ath10k itself: hakios.lx10k.c (no wcn3990=1 exchange beside it) */
++			if (done == last_step && done >= 10 && PE_parse_boot_argn("wlan_ath10k", &wlan10k, sizeof(wlan10k)) && wlan10k != 0) {
++				hakios_lx10k_start(done);
++			}
+ 		}
+ 	}
+ 	new_from = STEPS + 1;
+@@ -6534,6 +6546,8 @@
+ 		return;
+ 	}
+ 	soc_override();
++	extern void hakios_lx10k_reserve(void);
++	hakios_lx10k_reserve();
+ 	if (last_step == 0) {
+ 		/* all of it, on a thread of its own, and left up */
+ 		last_step = STEPS;
+--- a/xnu/files/bsd/dev/hakios.sta.c
++++ b/xnu/files/bsd/dev/hakios.sta.c
+@@ -174,6 +174,7 @@
+ 		lck_mtx_unlock(&sta_lock);
+ 		return;
+ 	}
++	hakios_wifi_tell("station-check: allocating scan cache\n");
+ 	if (heard == NULL) {
+ 		heard = kalloc_data(HEARD_MOST * sizeof(*heard), Z_WAITOK | Z_ZERO);
+ 	}
+@@ -181,6 +182,7 @@
+ 		hakios_wifi_tell("wifi: no memory for what a scan hears: nobody can ask the radio for a network\n");
+ 		return;
+ 	}
++	hakios_wifi_tell("station-check: creating station worker\n");
+ 	if (!sta_thread_made) {
+ 		if (kernel_thread_start(sta_runs, NULL, &thread) != KERN_SUCCESS) {
+ 			hakios_wifi_tell("wifi: no thread for the station: nobody can ask the radio for a network\n");
+@@ -190,13 +192,17 @@
+ 		thread_deallocate(thread);
+ 		sta_thread_made = true;
+ 	}
++	hakios_wifi_tell("station-check: BEFORE channels callback\n");
+ 	channel_count = ops->channels(channels, CHANNELS_MOST);
++	hakios_wifi_tell("station-check: AFTER channels callback\n");
+ 	lck_mtx_lock(&sta_lock);
+ 	sta_ops = ops;
+ 	sta_on = true;
+ 	lck_mtx_unlock(&sta_lock);
+ 	thread_wakeup((event_t)&sta_ops);
++	hakios_wifi_tell("station-check: BEFORE power event\n");
+ 	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
++	hakios_wifi_tell("station-check: AFTER power event\n");
+ }
+ 
+ void
+--- a/xnu/files/bsd/dev/hakios.wifi.c
++++ b/xnu/files/bsd/dev/hakios.wifi.c
+@@ -3915,9 +3915,21 @@
+ 	return true;
+ }
+ 
++/*
++ * The X01A's side of ath10k, in bsd/dev/hakios.lx10k.c: with the boot-arg wlan_ath10k these
++ * two of this file's services for the driver come from there instead (the radio's view of
++ * memory is that phone's stream of the SMMU, and the files are its kernel's).
++ */
++bool hakios_lx10k_wants(void);
++bool hakios_lx10k_radio_map(uint64_t physical, uint64_t size, unsigned long long *address);
++const uint8_t *hakios_lx10k_driver_file(const char *name, uint64_t *size);
++
+ bool
+ hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address)
+ {
++	if (hakios_lx10k_wants()) {
++		return hakios_lx10k_radio_map(physical, size, address);
++	}
+ 	return radio_map(physical, size, RADIO_PTE, address);
+ }
+ 
+@@ -3987,6 +3999,9 @@
+ hakios_wifi_driver_file(const char *name, uint64_t *size)
+ {
+ 	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
++	if (hakios_lx10k_wants()) {
++		return hakios_lx10k_driver_file(name, size);
++	}
+ 	const char *last = strrchr(name, '/');
+ 
+ 	last = last == NULL ? name : last + 1;

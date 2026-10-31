@@ -1,4 +1,9 @@
-# Modem (first step towards Wi-Fi)
+# Modem and WCN3990 firmware bring-up
+
+**2026-10-31 update:** the data path and iOS integration now work. Use
+[the unified Wi-Fi workflow](../wifi/README.md). The sections below describe the earlier
+firmware-control bring-up; `wcn3990=1` is a diagnostic alternative, not an option to combine
+with the working `wlan_ath10k=1` path.
 
 On the X01A the Wi-Fi firmware (WCN3990) runs inside the modem, so Wi-Fi starts with the modem.
 HakiOS already boots the POCO's modem (`bsd/dev/hakios.mpss.c`). The X01A's numbers are almost all
@@ -91,7 +96,7 @@ Boot-args: `wcn3990_upto=N` stops after step N, `wcn3990_power=0` leaves the sup
 The kernel's boot-args hold 607 characters and the loader adds about 95. `tools/run.sh` refuses
 more than 500 of ours, after a cut-off line once dropped `modem_ipa=0` and hung the phone.
 
-## Next
+## Original next steps (completed by the Wi-Fi integration)
 
 1. The data path: ath10k SNOC copy engines at 0x18800000, behind the SMMU, then HTC, WMI and HTT
    over them. HakiOS has ath11k only. This is the big piece.

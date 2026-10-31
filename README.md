@@ -14,12 +14,15 @@ Works:
 - boots to the home screen, all 8 cores (about 80 s from launchd to SpringBoard)
 - touch screen, multitouch
 - power, volume up and volume down
-- battery level (read once at boot), local time zone
+- local time zone; battery reporting is diagnostic-only because `battery=1` blocks reliable USB return
 - a clean boot screen: no text, just the logo, then iOS
 - the picture in its real proportions (iOS thinks it's an iPhone X, 1125x2436, so it's drawn at
   887x1920 in the middle of the 1080x1920 panel)
 
-Doesn't work yet: sound, Wi-Fi, Bluetooth, cellular, cameras, GPU (rendering is in software),
+- WPA2 Wi-Fi auto-join, Settings network picker, DNS and Safari (see [Wi-Fi](wifi/README.md));
+  signal-strength display is incomplete
+
+Doesn't work yet: sound, Bluetooth, cellular, cameras, GPU (rendering is in software),
 charging, and anything that needs an Apple account. See [NOTES.md](NOTES.md) for what was found on
 the way, and what the next pieces would take.
 
@@ -37,8 +40,9 @@ port to the SM7250 that stays separate from this repo. This repo adds HakiOS on 
 ```
 uefi/     HakiOS's UEFI hook, adapted: boot shim payload copy, XNU loader start, payload region
 loader/   X01A patch for HakiOS's loader (xnuloader/) and a build script
-kernel/   X01A patch for HakiOS's kernel (xnu/files) and an apply script
-tools/    mkxnuimg.py (the boot image) and run.sh (one run, start to log)
+kernel/   base X01A + Wi-Fi patches for HakiOS (xnu/files), applied together
+wifi/     WCN3990 ath10k platform layer, station glue and userland network integration
+tools/    unified kernel/Wi-Fi/image builds, mkxnuimg.py and run.sh (start to log)
 ```
 
 What the patches change, compared to the POCO:
@@ -74,7 +78,9 @@ uefi/apply.sh ~/Mu-Silicium
 kernel/apply.sh ~/hakios                  # patches xnu/files
 (cd ~/hakios && xnu/apply.sh && xnu-deps/setup.sh)
 kernel/apply.sh ~/hakios                  # again, for the kernel's file list
-(cd ~/hakios && ./xnu-build.sh -j12 -k)
+# Place the two checksum-pinned source archives in downloads/ (wifi/README.md).
+tools/build_wifi.sh ~/hakios
+tools/build_kernel.sh ~/hakios build -j12
 
 # iOS images and the loader's identity, from Apple's IPSW
 (cd ~/hakios && sysimage/fetch.sh && xnuloader/mkidentity.sh)
@@ -85,8 +91,12 @@ cd ~/Mu-Silicium && python3 build_uefi.py -d x01a -r RELEASE && cd -
 loader/build.sh ~/hakios ~/Mu-Silicium    # -> out/xnu-usb.img
 ```
 
-`xnu-build.sh` ends with errors about `.symbolset` files. Those are kext export lists, and the
-kernel itself is fine. Its lldb macros want `python`, so on Ubuntu install `python-is-python3`.
+The kernel-only `build` target avoids the separate IOKit symbolset target, whose
+`IOService::_Dispatch` export failure remains unresolved. No check is suppressed. On Ubuntu,
+the LLDB macro tooling also needs `python-is-python3`.
+
+For the tested Wi-Fi image, firmware and credential setup, follow [wifi/README.md](wifi/README.md).
+The Wi-Fi builder preserves APFS permissions/ownership even when staging on a Windows drive.
 
 ## Running
 
@@ -96,7 +106,10 @@ tools/run.sh ~/hakios 240
 
 That boots the loader, uploads the 2.4 GB system image into RAM, and runs iOS for 240 seconds.
 Then it brings back the log. The phone has to be unlocked (`fastboot boot` allowed). The kernel
-gets `cpus=8 touchscreen=1 buttons=1 battery=1`; `ARGS="... -v"` shows the boot text instead.
+gets `cpus=8 touchscreen=1 buttons=1`; `ARGS="... -v"` shows the boot text instead.
+`battery=1` is rejected because it prevents reliable USB return on this phone.
+Use `WIFI=1` with the private Wi-Fi image and permanent WLAN MAC for auto-join plus the picker;
+see [Wi-Fi running instructions](wifi/README.md#running).
 `RESIDENT=1` skips the upload when the loader is still up from the last run.
 
 Things to know:
@@ -105,14 +118,16 @@ Things to know:
   doesn't answer, and UEFI's USB driver can't recover from that once the kernel hands back.
 - On Windows the loader shows up as `xnuloader` (18D1:D00D). The first time, pick "Android
   Bootloader Interface" for it in Device Manager.
-- There's no watchdog on this phone, so if something hangs, hold power for about 15 seconds.
+- The virtual-watchdog interface used on the POCO is unavailable here. Hold power for about
+  15 seconds if the phone hangs. Late USB log return can still fail, including after working Wi-Fi.
 - The loader writes its log to the raw `logdump` partition, as HakiOS does on the POCO. On the X01A
   it's 64 MB of zeros. Back it up first anyway.
 
 ## Licenses
 
+Imported Wi-Fi source provenance is documented in [wifi/NOTICE.md](wifi/NOTICE.md).
 Each part keeps the license of what it changes: `kernel/` is APSL 2.0 (a derivative of XNU, like
 HakiOS's `xnu/`), `loader/` and the scripts are MIT (like HakiOS's loader and tools), and `uefi/` is
-BSD-2-Clause-Patent (Mu-Silicium). No Apple files are in this repo. The
+BSD-2-Clause-Patent (Mu-Silicium). No proprietary Apple binaries are in this repo. The
 iOS images and the loader's identity are made on your machine from Apple's IPSW. Not affiliated
 with Apple, BALMUDA or Kyocera.

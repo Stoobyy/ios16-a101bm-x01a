@@ -5,6 +5,7 @@
 # MODEM=1 SYSTEM=1 puts HAKIOS_DIR/fw-modem into the system image as HakiOS does, but checks it
 # against MODEM_DTB (the X01A's own device tree) instead of the POCO's.
 set -e
+HERE=$(cd "$(dirname "$0")/.." && pwd)
 H=$(cd "$1" && pwd)
 ZONE=${2:-$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)}
 SHIM=$(mktemp -d); trap 'rm -rf "$SHIM"' EXIT
@@ -25,3 +26,10 @@ if [ -n "$MODEM" ] && [ -n "$MODEM_DTB" ]; then
 fi
 PATH="$SHIM:$PATH" REST=1 bash "$BUILD"
 grep -q "zoneinfo/$ZONE" userland/root/etc/var.skel && echo "build_userland.sh: time zone $ZONE"
+
+# The Wi-Fi image is derived from the canonical root image, retaining its manifest metadata.
+if [ "${WIFI:-0}" = 1 ]; then
+ python3 "$HERE/tools/build_wifi_userland.py" "$H" \
+   --network-file "${WIFI_NETWORK_FILE:-$HERE/private/network}" \
+   --output "${WIFI_ROOT_APFS:-$HERE/out/wifi-root.apfs}"
+fi
